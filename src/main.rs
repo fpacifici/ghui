@@ -90,7 +90,9 @@ fn execute<G: GitHub>(app: &mut App, worker: &Worker<G>, effects: Vec<Effect>, c
             Effect::OpenUrl(url) => {
                 open::that_detached(&url).map_err(|e| format!("cannot open {url}: {e}"))
             }
-            Effect::FetchPrs { .. } => unreachable!("network effects are spawned"),
+            Effect::FetchPrs { .. } | Effect::FetchOpenPrs { .. } => {
+                unreachable!("network effects are spawned")
+            }
         };
         if let Err(message) = result {
             app.report_error(message);

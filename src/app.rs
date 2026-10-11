@@ -9,7 +9,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::config::Config;
 use crate::event::Action;
-use crate::github::{ApiError, PrDetail, PrResult};
+use crate::github::{ApiError, PrDetail, PrResult, PrSummary};
 
 /// Poll interval while the selected PR has pending checks.
 pub const FAST_POLL: TimeDelta = TimeDelta::seconds(5);
@@ -22,6 +22,7 @@ const RATE_LIMIT_BACKOFF: TimeDelta = TimeDelta::seconds(60);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     FetchPrs { repo: String, numbers: Vec<u64> },
+    FetchOpenPrs { repo: String },
     SaveConfig(Config),
     CopyToClipboard(String),
     OpenUrl(String),
@@ -34,6 +35,28 @@ pub enum Msg {
         repo: String,
         result: Result<Vec<PrResult>, ApiError>,
     },
+    OpenPrs {
+        repo: String,
+        result: Result<Vec<PrSummary>, ApiError>,
+    },
+}
+
+/// Rows moved by `PgUp` / `PgDn` in lists.
+const PAGE: isize = 10;
+
+/// A window drawn over the main view that takes all input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Modal {
+    Picker(Picker),
+}
+
+/// The add-PR picker: open PRs of `repo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Picker {
+    pub repo: String,
+    /// `None` while loading.
+    pub items: Option<Result<Vec<PrSummary>, String>>,
+    pub selected: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -132,6 +155,7 @@ pub struct App {
     pub repos: Vec<RepoState>,
     pub active: usize,
     pub focus: Focus,
+    pub modal: Option<Modal>,
     /// Transient error shown above the footer; cleared by the next
     /// successful fetch.
     pub status: Option<String>,
@@ -154,6 +178,7 @@ impl App {
             repos,
             active: 0,
             focus: Focus::default(),
+            modal: None,
             status: None,
             rate_limited_until: None,
             now,
@@ -171,6 +196,13 @@ impl App {
 
     /// Applies a user action.
     pub fn apply(&mut self, action: Action) -> Vec<Effect> {
+        if action == Action::ForceQuit {
+            self.running = false;
+            return Vec::new();
+        }
+        if let Some(modal) = self.modal.take() {
+            return self.apply_modal(modal, action);
+        }
         match action {
             Action::ForceQuit | Action::Quit => self.running = false,
             Action::NextRepo => self.switch_repo(1),
@@ -197,15 +229,99 @@ impl App {
                     return vec![Effect::OpenUrl(url)];
                 }
             }
-            Action::Close | Action::PageUp | Action::PageDown | Action::Enter | Action::AddPr => {}
+            Action::PageUp => self.move_selection(-PAGE),
+            Action::PageDown => self.move_selection(PAGE),
+            Action::AddPr => return self.open_picker(),
+            Action::Close | Action::Enter => {}
         }
         Vec::new()
+    }
+
+    /// Input while a modal is open. The modal has been taken out of `self`
+    /// and is put back unless the action closes it.
+    fn apply_modal(&mut self, modal: Modal, action: Action) -> Vec<Effect> {
+        if matches!(action, Action::Quit | Action::Close) {
+            return Vec::new();
+        }
+        match modal {
+            Modal::Picker(mut picker) => {
+                let len = match &picker.items {
+                    Some(Ok(items)) => items.len(),
+                    _ => 0,
+                };
+                let delta = match action {
+                    Action::Up => -1,
+                    Action::Down => 1,
+                    Action::PageUp => -PAGE,
+                    Action::PageDown => PAGE,
+                    Action::Top => isize::MIN,
+                    Action::Bottom => isize::MAX,
+                    Action::Enter => return self.pick(picker),
+                    _ => 0,
+                };
+                picker.selected = step(picker.selected, delta, len);
+                self.modal = Some(Modal::Picker(picker));
+            }
+        }
+        Vec::new()
+    }
+
+    fn open_picker(&mut self) -> Vec<Effect> {
+        let Some(repo) = self.active_repo() else {
+            self.status = Some(format!("Add a repo to {} first", self.config_path));
+            return Vec::new();
+        };
+        let repo = repo.name.clone();
+        self.modal = Some(Modal::Picker(Picker {
+            repo: repo.clone(),
+            items: None,
+            selected: 0,
+        }));
+        vec![Effect::FetchOpenPrs { repo }]
+    }
+
+    /// Tracks the PR under the cursor, closes the picker and selects it.
+    /// Already tracked PRs leave the picker open.
+    fn pick(&mut self, picker: Picker) -> Vec<Effect> {
+        let number = match &picker.items {
+            Some(Ok(items)) => items.get(picker.selected).map(|p| p.number),
+            _ => None,
+        };
+        let Some(repo) = self.repos.iter_mut().find(|r| r.name == picker.repo) else {
+            return Vec::new();
+        };
+        let Some(number) = number.filter(|n| !repo.prs.iter().any(|p| p.number == *n)) else {
+            self.modal = Some(Modal::Picker(picker));
+            return Vec::new();
+        };
+        repo.prs.push(PrEntry::new(number));
+        repo.selected_pr = repo.prs.len() - 1;
+        repo.selected_check = 0;
+        repo.force = true;
+        self.focus = Focus::List;
+        self.config.track(&picker.repo, number);
+        vec![Effect::SaveConfig(self.config.clone())]
+    }
+
+    /// Whether `number` is tracked in `repo`; used to mark picker rows.
+    pub fn is_tracked(&self, repo: &str, number: u64) -> bool {
+        self.repos
+            .iter()
+            .any(|r| r.name == repo && r.prs.iter().any(|p| p.number == number))
     }
 
     /// Applies the result of a network effect.
     pub fn handle(&mut self, msg: Msg, now: DateTime<Utc>) {
         match msg {
             Msg::Prs { repo, result } => self.handle_prs(&repo, result, now),
+            Msg::OpenPrs { repo, result } => {
+                if let Some(Modal::Picker(picker)) = &mut self.modal
+                    && picker.repo == repo
+                {
+                    picker.items = Some(result.map_err(|e| e.to_string()));
+                    picker.selected = 0;
+                }
+            }
         }
     }
 
@@ -627,5 +743,120 @@ pub(crate) mod tests {
         assert!(app.tick(t(0)).is_empty());
         app.apply(Action::Quit);
         assert!(!app.running);
+    }
+
+    fn summaries(numbers: &[u64]) -> Vec<PrSummary> {
+        numbers
+            .iter()
+            .map(|n| PrSummary {
+                number: *n,
+                title: format!("open {n}"),
+                author: "x".into(),
+                is_draft: false,
+            })
+            .collect()
+    }
+
+    fn open_picker_with(app: &mut App, numbers: &[u64]) {
+        assert_eq!(
+            app.apply(Action::AddPr),
+            vec![Effect::FetchOpenPrs { repo: "o/a".into() }]
+        );
+        app.handle(
+            Msg::OpenPrs {
+                repo: "o/a".into(),
+                result: Ok(summaries(numbers)),
+            },
+            t(1),
+        );
+    }
+
+    #[test]
+    fn picker_adds_the_pr_saves_and_selects_it() {
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        app.tick(t(0));
+        app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(0));
+        app.focus = Focus::Checks;
+        open_picker_with(&mut app, &[5, 1, 9]);
+        app.apply(Action::Down);
+        app.apply(Action::Down);
+        assert_eq!(
+            app.apply(Action::Enter),
+            vec![Effect::SaveConfig(config(&[("o/a", &[1, 9])]))]
+        );
+        assert_eq!(app.modal, None);
+        assert_eq!(app.focus, Focus::List);
+        assert_eq!(app.repos[0].selected().unwrap().number, 9);
+        assert!(app.is_tracked("o/a", 9));
+        // The new PR is fetched right away.
+        assert_eq!(app.tick(t(2)), vec![fetch("o/a", &[1, 9])]);
+    }
+
+    #[test]
+    fn picking_a_tracked_pr_does_nothing() {
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        open_picker_with(&mut app, &[1]);
+        assert!(app.apply(Action::Enter).is_empty());
+        assert!(matches!(app.modal, Some(Modal::Picker(_))));
+    }
+
+    #[test]
+    fn picker_takes_all_input_and_closes_on_esc_or_q() {
+        let mut app = App::new(config(&[("o/a", &[]), ("o/b", &[])]), "cfg".into(), t(0));
+        open_picker_with(&mut app, &[1, 2, 3]);
+        app.apply(Action::NextRepo);
+        assert_eq!(app.active, 0);
+        app.apply(Action::Bottom);
+        app.apply(Action::Down);
+        let Some(Modal::Picker(picker)) = &app.modal else {
+            panic!("picker closed")
+        };
+        assert_eq!(picker.selected, 2);
+        app.apply(Action::Quit);
+        assert_eq!(app.modal, None);
+        assert!(app.running);
+
+        open_picker_with(&mut app, &[1]);
+        app.apply(Action::Close);
+        assert_eq!(app.modal, None);
+        open_picker_with(&mut app, &[1]);
+        app.apply(Action::ForceQuit);
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn picker_shows_listing_errors_and_ignores_stale_results() {
+        let mut app = App::new(config(&[("o/a", &[])]), "cfg".into(), t(0));
+        app.apply(Action::AddPr);
+        app.handle(
+            Msg::OpenPrs {
+                repo: "o/other".into(),
+                result: Ok(summaries(&[1])),
+            },
+            t(1),
+        );
+        let Some(Modal::Picker(picker)) = &app.modal else {
+            panic!("picker closed")
+        };
+        assert_eq!(picker.items, None);
+        app.handle(
+            Msg::OpenPrs {
+                repo: "o/a".into(),
+                result: Err(ApiError::Network("down".into())),
+            },
+            t(1),
+        );
+        let Some(Modal::Picker(picker)) = &app.modal else {
+            panic!("picker closed")
+        };
+        assert!(matches!(&picker.items, Some(Err(e)) if e.contains("down")));
+        assert!(app.apply(Action::Enter).is_empty());
+    }
+
+    #[test]
+    fn add_without_repos_explains_what_to_do() {
+        let mut app = App::new(Config::default(), "cfg".into(), t(0));
+        assert!(app.apply(Action::AddPr).is_empty());
+        assert!(app.status.as_deref().unwrap().contains("cfg"));
     }
 }

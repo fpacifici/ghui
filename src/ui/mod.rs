@@ -7,10 +7,11 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
-use crate::app::{App, Focus};
+use crate::app::{App, Focus, Modal};
 
 mod checks;
 mod detail;
+mod picker;
 mod pr_list;
 mod tabs;
 
@@ -30,6 +31,11 @@ pub fn render(app: &App, frame: &mut Frame) {
         frame.render_widget(Line::from(format!(" {status}")).red(), status_area);
     }
     frame.render_widget(footer(app), footer_area);
+
+    match &app.modal {
+        Some(Modal::Picker(p)) => picker::render(app, p, frame, body_area),
+        None => {}
+    }
 }
 
 fn render_body(app: &App, frame: &mut Frame, area: Rect) {
@@ -85,15 +91,27 @@ fn render_empty_config(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn footer(app: &App) -> Line<'static> {
-    let keys = match app.focus {
-        Focus::List => {
+    let keys = match (&app.modal, app.focus) {
+        (Some(Modal::Picker(_)), _) => " esc close · j/k move · pgup/pgdn page · enter add",
+        (None, Focus::List) => {
             " q quit · </> repo · → checks · j/k move · ^A add · d untrack · r refresh · y copy url · o open"
         }
-        Focus::Checks => {
+        (None, Focus::Checks) => {
             " q quit · </> repo · ← PRs · j/k move · enter logs · r refresh · y copy url · o open check"
         }
     };
     Line::from(keys).dark_gray()
+}
+
+/// A `width_pct` × `height_pct` rectangle centered in `area`.
+pub(crate) fn centered(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
+    let [area] = Layout::horizontal([Constraint::Percentage(width_pct)])
+        .flex(ratatui::layout::Flex::Center)
+        .areas(area);
+    let [area] = Layout::vertical([Constraint::Percentage(height_pct)])
+        .flex(ratatui::layout::Flex::Center)
+        .areas(area);
+    area
 }
 
 /// Border style of a pane, highlighted when it has focus.
@@ -287,5 +305,34 @@ pub(crate) mod tests {
         assert_eq!(elapsed(Some(t(0)), t(45)), "45s");
         assert_eq!(elapsed(Some(t(0)), t(192)), "3m12s");
         assert_eq!(elapsed(Some(t(0)), t(3900)), "1h5m");
+    }
+
+    #[test]
+    fn picker_marks_tracked_prs() {
+        let mut app = sample_app();
+        app.apply(Action::AddPr);
+        let out = text(&draw(&app, 120, 30));
+        assert!(out.contains("Loading open PRs…"));
+        let summary = |number, title: &str, is_draft| crate::github::PrSummary {
+            number,
+            title: title.into(),
+            author: "bob".into(),
+            is_draft,
+        };
+        app.handle(
+            Msg::OpenPrs {
+                repo: "o/a".into(),
+                result: Ok(vec![
+                    summary(1, "tracked", false),
+                    summary(7, "new one", true),
+                ]),
+            },
+            t(0),
+        );
+        let out = text(&draw(&app, 120, 30));
+        assert!(out.contains("Add a PR to o/a"));
+        assert!(out.contains("✓ #1 tracked  bob"));
+        assert!(out.contains("#7 new one  bob [draft]"));
+        assert!(out.contains("enter add"));
     }
 }

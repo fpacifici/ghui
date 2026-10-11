@@ -37,6 +37,13 @@ impl<G: GitHub> Worker<G> {
                 });
                 None
             }
+            Effect::FetchOpenPrs { repo } => {
+                self.runtime.spawn(async move {
+                    let result = github.open_prs(&repo).await;
+                    let _ = results.send(Msg::OpenPrs { repo, result });
+                });
+                None
+            }
             other => Some(other),
         }
     }
