@@ -77,7 +77,14 @@ pending checks, every 60 s otherwise (and every 60 s for a repo that failed
 to load). The interval is evaluated on each tick against the current
 selection, so selecting a running PR speeds polling up immediately.
 Inactive tabs are fetched once at start-up and then every 60 s only while
-one of their PRs has pending checks; switching to a tab refreshes it. An open log window for a running Actions job re-fetches the log
+one of their PRs has pending checks; switching to a tab refreshes it.
+
+**Manual refresh** ([spec 0006](specs/0006-refresh-all.md)): `r` sets
+`force` and `detect_force` on every repo, so the next tick fetches every
+tab's PRs (dropping closed ones) and lists every loaded tab's open PRs
+(adding the user's new ones), whatever the schedule. `App::refreshing`
+drives the tab bar's `⟳ refreshing…` label until no repo is forced or in
+flight. An open log window for a running Actions job re-fetches the log
 every 5 s and does one final fetch after the job completes. A rate limit
 pauses all polling until its reset time.
 
