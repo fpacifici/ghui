@@ -25,6 +25,9 @@ pub trait GitHub: Send + Sync + 'static {
     fn open_prs(&self, repo: &str)
     -> impl Future<Output = Result<Vec<PrSummary>, ApiError>> + Send;
 
+    /// The login of the authenticated user.
+    fn viewer_login(&self) -> impl Future<Output = Result<String, ApiError>> + Send;
+
     /// The plain-text log of an Actions job. `Ok(None)` means the log is
     /// not available (yet).
     fn job_log(

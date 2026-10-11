@@ -18,12 +18,16 @@ pub const FAST_POLL: TimeDelta = TimeDelta::seconds(5);
 pub const SLOW_POLL: TimeDelta = TimeDelta::seconds(60);
 /// Pause after a rate limit without a reset time.
 const RATE_LIMIT_BACKOFF: TimeDelta = TimeDelta::seconds(60);
+/// How often the active repo is checked for new PRs by the user, and the
+/// retry interval for looking up who the user is.
+pub const DETECT_POLL: TimeDelta = SLOW_POLL;
 
 /// Work for the main loop. Network effects come back as a [`Msg`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     FetchPrs { repo: String, numbers: Vec<u64> },
     FetchOpenPrs { repo: String },
+    FetchViewer,
     FetchLog { repo: String, job_id: u64 },
     SaveConfig(Config),
     CopyToClipboard(String),
@@ -41,6 +45,7 @@ pub enum Msg {
         repo: String,
         result: Result<Vec<PrSummary>, ApiError>,
     },
+    Viewer(Result<String, ApiError>),
     Log {
         repo: String,
         job_id: u64,
@@ -106,6 +111,10 @@ pub struct RepoState {
     force: bool,
     /// When the last fetch completed; `None` means a fetch is due now.
     last_poll: Option<DateTime<Utc>>,
+    /// Autodetect: an open-PR listing is in flight.
+    detect_in_flight: bool,
+    /// Autodetect: when the last open-PR listing completed.
+    last_detect: Option<DateTime<Utc>>,
 }
 
 impl RepoState {
@@ -119,6 +128,8 @@ impl RepoState {
             in_flight: false,
             force: false,
             last_poll: None,
+            detect_in_flight: false,
+            last_detect: None,
         }
     }
 
@@ -154,6 +165,15 @@ impl RepoState {
     }
 }
 
+/// The authenticated user, looked up once for autodetect.
+#[derive(Debug, Default)]
+struct Viewer {
+    login: Option<String>,
+    in_flight: bool,
+    /// When the last failed lookup completed.
+    last_attempt: Option<DateTime<Utc>>,
+}
+
 /// All state of the application.
 #[derive(Debug)]
 pub struct App {
@@ -174,6 +194,7 @@ pub struct App {
     /// Time of the last tick; used to render elapsed times.
     pub now: DateTime<Utc>,
     pub running: bool,
+    viewer: Viewer,
 }
 
 impl App {
@@ -195,6 +216,7 @@ impl App {
             rate_limited_until: None,
             now,
             running: true,
+            viewer: Viewer::default(),
         }
     }
 
@@ -367,17 +389,25 @@ impl App {
     }
 
     /// Applies the result of a network effect.
-    pub fn handle(&mut self, msg: Msg, now: DateTime<Utc>) {
+    pub fn handle(&mut self, msg: Msg, now: DateTime<Utc>) -> Vec<Effect> {
         match msg {
             Msg::Prs { repo, result } => self.handle_prs(&repo, result, now),
             Msg::OpenPrs { repo, result } => {
+                if let Err(ApiError::RateLimited { reset }) = &result {
+                    self.rate_limited(*reset, now);
+                }
+                // Autodetect and the picker share the listing; a picker that
+                // already shows PRs is not reset under the cursor.
                 if let Some(Modal::Picker(picker)) = &mut self.modal
                     && picker.repo == repo
+                    && !matches!(picker.items, Some(Ok(_)))
                 {
-                    picker.items = Some(result.map_err(|e| e.to_string()));
+                    picker.items = Some(result.clone().map_err(|e| e.to_string()));
                     picker.selected = 0;
                 }
+                return self.autodetect(&repo, result.ok(), now);
             }
+            Msg::Viewer(result) => self.handle_viewer(result, now),
             Msg::Log {
                 repo,
                 job_id,
@@ -394,6 +424,57 @@ impl App {
                 }
             }
         }
+        Vec::new()
+    }
+
+    fn handle_viewer(&mut self, result: Result<String, ApiError>, now: DateTime<Utc>) {
+        self.viewer.in_flight = false;
+        match result {
+            Ok(login) => self.viewer.login = Some(login),
+            Err(e) => {
+                self.viewer.last_attempt = Some(now);
+                match e {
+                    ApiError::RateLimited { reset } => self.rate_limited(reset, now),
+                    e => self.status = Some(format!("cannot detect your PRs: {e}")),
+                }
+            }
+        }
+    }
+
+    /// Tracks the open PRs of `name` authored by the user that are neither
+    /// tracked nor dismissed. `prs` is `None` when the listing failed.
+    fn autodetect(
+        &mut self,
+        name: &str,
+        prs: Option<Vec<PrSummary>>,
+        now: DateTime<Utc>,
+    ) -> Vec<Effect> {
+        let Some(repo) = self.repos.iter_mut().find(|r| r.name == name) else {
+            return Vec::new();
+        };
+        repo.detect_in_flight = false;
+        repo.last_detect = Some(now);
+        let (Some(login), Some(prs)) = (&self.viewer.login, prs) else {
+            return Vec::new();
+        };
+        let mut new: Vec<u64> = prs
+            .iter()
+            .filter(|p| p.author.eq_ignore_ascii_case(login))
+            .map(|p| p.number)
+            .filter(|n| !repo.prs.iter().any(|p| p.number == *n))
+            .filter(|n| !self.config.is_dismissed(name, *n))
+            .collect();
+        if new.is_empty() {
+            return Vec::new();
+        }
+        new.sort_unstable();
+        new.dedup();
+        for number in new {
+            repo.prs.push(PrEntry::new(number));
+            self.config.track(name, number);
+        }
+        repo.force = true;
+        vec![Effect::SaveConfig(self.config.clone())]
     }
 
     /// Advances the clock and returns the polls that are due.
@@ -423,8 +504,46 @@ impl App {
                 });
             }
         }
+        effects.extend(self.tick_viewer(now));
+        effects.extend(self.tick_detect(now));
         effects.extend(self.tick_log(now));
         effects
+    }
+
+    /// Looks up the user's login once, retrying failures every
+    /// [`DETECT_POLL`]. Not needed until there is a repo to check.
+    fn tick_viewer(&mut self, now: DateTime<Utc>) -> Option<Effect> {
+        let viewer = &mut self.viewer;
+        let due = viewer.login.is_none()
+            && !viewer.in_flight
+            && !self.repos.is_empty()
+            && viewer
+                .last_attempt
+                .is_none_or(|last| now >= last + DETECT_POLL);
+        if !due {
+            return None;
+        }
+        viewer.in_flight = true;
+        Some(Effect::FetchViewer)
+    }
+
+    /// Lists the active repo's open PRs every [`DETECT_POLL`] once the
+    /// user's login is known, so their new PRs get tracked.
+    fn tick_detect(&mut self, now: DateTime<Utc>) -> Option<Effect> {
+        self.viewer.login.as_ref()?;
+        let repo = self.repos.get_mut(self.active)?;
+        let due = repo.error.is_none()
+            && !repo.detect_in_flight
+            && repo
+                .last_detect
+                .is_none_or(|last| now >= last + DETECT_POLL);
+        if !due {
+            return None;
+        }
+        repo.detect_in_flight = true;
+        Some(Effect::FetchOpenPrs {
+            repo: repo.name.clone(),
+        })
     }
 
     fn rate_limited(&mut self, reset: Option<DateTime<Utc>>, now: DateTime<Utc>) {
@@ -599,6 +718,7 @@ pub(crate) mod tests {
                 .map(|(name, prs)| RepoConfig {
                     name: name.to_string(),
                     prs: prs.to_vec(),
+                    dismissed: vec![],
                 })
                 .collect(),
         }
@@ -658,8 +778,11 @@ pub(crate) mod tests {
             "cfg".into(),
             t(0),
         );
-        assert_eq!(app.tick(t(0)), vec![fetch("o/a", &[1, 2])]);
-        // Nothing more while the request is in flight.
+        assert_eq!(
+            app.tick(t(0)),
+            vec![fetch("o/a", &[1, 2]), Effect::FetchViewer]
+        );
+        // Nothing more while the requests are in flight.
         assert!(app.tick(t(10)).is_empty());
     }
 
@@ -823,7 +946,9 @@ pub(crate) mod tests {
         let mut app = App::new(config(&[("o/a", &[1, 2])]), "cfg".into(), t(0));
         app.apply(Action::Down);
         let effects = app.apply(Action::Untrack);
-        assert_eq!(effects, vec![Effect::SaveConfig(config(&[("o/a", &[1])]))]);
+        let mut expected = config(&[("o/a", &[1])]);
+        expected.repos[0].dismissed = vec![2];
+        assert_eq!(effects, vec![Effect::SaveConfig(expected)]);
         assert_eq!(app.repos[0].prs.len(), 1);
         assert_eq!(app.repos[0].selected_pr, 0);
     }
@@ -858,6 +983,190 @@ pub(crate) mod tests {
         assert!(app.tick(t(0)).is_empty());
         app.apply(Action::Quit);
         assert!(!app.running);
+    }
+
+    fn by(author: &str, number: u64) -> PrSummary {
+        PrSummary {
+            number,
+            title: format!("open {number}"),
+            author: author.into(),
+            is_draft: false,
+        }
+    }
+
+    fn open_prs(repo: &str, prs: Vec<PrSummary>) -> Msg {
+        Msg::OpenPrs {
+            repo: repo.into(),
+            result: Ok(prs),
+        }
+    }
+
+    fn list_open(repo: &str) -> Effect {
+        Effect::FetchOpenPrs { repo: repo.into() }
+    }
+
+    /// An app whose first PR poll and login lookup ("me") are done.
+    fn detecting_app(repos: &[(&str, &[u64])]) -> App {
+        let mut app = App::new(config(repos), "cfg".into(), t(0));
+        app.tick(t(0));
+        app.handle(Msg::Viewer(Ok("me".into())), t(0));
+        app
+    }
+
+    #[test]
+    fn login_is_looked_up_once_and_retried_on_failure() {
+        let mut app = App::new(config(&[("o/a", &[])]), "cfg".into(), t(0));
+        assert!(app.tick(t(0)).contains(&Effect::FetchViewer));
+        assert!(!app.tick(t(1)).contains(&Effect::FetchViewer));
+        app.handle(Msg::Viewer(Err(ApiError::Network("down".into()))), t(1));
+        assert!(app.status.as_deref().unwrap().contains("down"));
+        assert!(!app.tick(t(60)).contains(&Effect::FetchViewer));
+        assert!(app.tick(t(61)).contains(&Effect::FetchViewer));
+        app.handle(Msg::Viewer(Ok("me".into())), t(62));
+        assert!(!app.tick(t(1000)).contains(&Effect::FetchViewer));
+    }
+
+    #[test]
+    fn no_login_lookup_without_repos() {
+        let mut app = App::new(Config::default(), "cfg".into(), t(0));
+        assert!(app.tick(t(0)).is_empty());
+    }
+
+    #[test]
+    fn detection_lists_the_active_repo_every_minute() {
+        let mut app = detecting_app(&[("o/a", &[]), ("o/b", &[])]);
+        assert_eq!(app.tick(t(1)), vec![list_open("o/a")]);
+        // Nothing more while the listing is in flight.
+        assert!(app.tick(t(2)).is_empty());
+        app.handle(open_prs("o/a", vec![]), t(2));
+        assert!(app.tick(t(61)).is_empty());
+        assert_eq!(app.tick(t(62)), vec![list_open("o/a")]);
+
+        // Only the active tab is checked.
+        app.handle(open_prs("o/a", vec![]), t(63));
+        app.apply(Action::NextRepo);
+        assert!(app.tick(t(64)).contains(&list_open("o/b")));
+        assert!(!app.tick(t(200)).contains(&list_open("o/a")));
+    }
+
+    #[test]
+    fn detection_waits_for_the_login_and_skips_failed_repos() {
+        let mut app = App::new(config(&[("o/a", &[])]), "cfg".into(), t(0));
+        app.tick(t(0));
+        assert!(!app.tick(t(100)).contains(&list_open("o/a")));
+        app.handle(
+            Msg::Prs {
+                repo: "o/a".into(),
+                result: Err(ApiError::NotFound("nope".into())),
+            },
+            t(100),
+        );
+        app.handle(Msg::Viewer(Ok("me".into())), t(100));
+        assert!(!app.tick(t(101)).contains(&list_open("o/a")));
+    }
+
+    #[test]
+    fn detection_tracks_the_users_new_prs_and_saves() {
+        let mut app = detecting_app(&[("o/a", &[1])]);
+        app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(0));
+        app.tick(t(1));
+        let effects = app.handle(
+            open_prs(
+                "o/a",
+                vec![by("me", 9), by("other", 5), by("ME", 1), by("Me", 7)],
+            ),
+            t(1),
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::SaveConfig(config(&[("o/a", &[1, 7, 9])]))]
+        );
+        let numbers: Vec<u64> = app.repos[0].prs.iter().map(|p| p.number).collect();
+        assert_eq!(numbers, vec![1, 7, 9]);
+        // The selection stays put and the new PRs are fetched right away.
+        assert_eq!(app.repos[0].selected_pr, 0);
+        assert_eq!(app.tick(t(2)), vec![fetch("o/a", &[1, 7, 9])]);
+
+        // Nothing new: nothing to save.
+        app.tick(t(100));
+        assert!(
+            app.handle(open_prs("o/a", vec![by("me", 9)]), t(100))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn untracked_prs_are_not_detected_again_until_picked() {
+        let mut app = detecting_app(&[("o/a", &[1, 2])]);
+        app.apply(Action::Down);
+        app.apply(Action::Untrack);
+        assert!(app.config.is_dismissed("o/a", 2));
+        app.tick(t(1));
+        assert!(
+            app.handle(open_prs("o/a", vec![by("me", 2)]), t(1))
+                .is_empty()
+        );
+        assert!(!app.is_tracked("o/a", 2));
+
+        // Picking it again tracks it and clears the dismissal.
+        open_picker_with(&mut app, &[2]);
+        assert_eq!(
+            app.apply(Action::Enter),
+            vec![Effect::SaveConfig(config(&[("o/a", &[1, 2])]))]
+        );
+    }
+
+    #[test]
+    fn dismissals_from_the_config_are_respected() {
+        let mut cfg = config(&[("o/a", &[])]);
+        cfg.repos[0].dismissed = vec![4];
+        let mut app = App::new(cfg, "cfg".into(), t(0));
+        app.handle(Msg::Viewer(Ok("me".into())), t(0));
+        assert!(
+            app.handle(open_prs("o/a", vec![by("me", 4)]), t(0))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn opening_the_picker_also_detects_and_marks_rows_tracked() {
+        let mut app = detecting_app(&[("o/a", &[])]);
+        open_picker_with(&mut app, &[]);
+        app.apply(Action::Close);
+        app.apply(Action::AddPr);
+        let effects = app.handle(open_prs("o/a", vec![by("x", 3), by("me", 8)]), t(1));
+        assert_eq!(effects, vec![Effect::SaveConfig(config(&[("o/a", &[8])]))]);
+        assert!(app.is_tracked("o/a", 8));
+        assert!(matches!(app.modal, Some(Modal::Picker(_))));
+    }
+
+    #[test]
+    fn a_background_listing_does_not_reset_the_open_picker() {
+        let mut app = detecting_app(&[("o/a", &[])]);
+        open_picker_with(&mut app, &[1, 2, 3]);
+        app.apply(Action::Down);
+        app.handle(open_prs("o/a", vec![by("x", 4)]), t(2));
+        let Some(Modal::Picker(picker)) = &app.modal else {
+            panic!("picker closed")
+        };
+        assert_eq!(picker.selected, 1);
+        assert_eq!(picker.items.as_ref().unwrap().as_ref().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn rate_limited_listing_pauses_polling() {
+        let mut app = detecting_app(&[("o/a", &[])]);
+        app.tick(t(1));
+        app.handle(
+            Msg::OpenPrs {
+                repo: "o/a".into(),
+                result: Err(ApiError::RateLimited {
+                    reset: Some(t(100)),
+                }),
+            },
+            t(1),
+        );
+        assert!(app.tick(t(99)).is_empty());
     }
 
     fn summaries(numbers: &[u64]) -> Vec<PrSummary> {

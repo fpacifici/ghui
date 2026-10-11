@@ -44,6 +44,13 @@ impl<G: GitHub> Worker<G> {
                 });
                 None
             }
+            Effect::FetchViewer => {
+                self.runtime.spawn(async move {
+                    let result = github.viewer_login().await;
+                    let _ = results.send(Msg::Viewer(result));
+                });
+                None
+            }
             Effect::FetchLog { repo, job_id } => {
                 self.runtime.spawn(async move {
                     let result = github.job_log(&repo, job_id).await;
@@ -86,6 +93,10 @@ pub(crate) mod tests {
             Ok(vec![])
         }
 
+        async fn viewer_login(&self) -> Result<String, ApiError> {
+            Ok("me".into())
+        }
+
         async fn job_log(&self, _repo: &str, job_id: u64) -> Result<Option<String>, ApiError> {
             Ok(Some(format!("log {job_id}")))
         }
@@ -110,6 +121,16 @@ pub(crate) mod tests {
                 result: Ok(vec![(1, Err("fake 1".into()))]),
             }
         );
+    }
+
+    #[test]
+    fn viewer_login_comes_back_as_a_message() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let worker = Worker::new(FakeGitHub, runtime.handle().clone(), tx);
+        assert_eq!(worker.spawn(Effect::FetchViewer), None);
+        let msg = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(msg, Msg::Viewer(Ok("me".into())));
     }
 
     #[test]

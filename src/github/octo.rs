@@ -41,6 +41,11 @@ impl GitHub for OctoGitHub {
         parse::open_prs(&response)
     }
 
+    async fn viewer_login(&self) -> Result<String, ApiError> {
+        let user = self.crab.current().user().await.map_err(map_err)?;
+        Ok(user.login)
+    }
+
     async fn job_log(&self, repo: &str, job_id: u64) -> Result<Option<String>, ApiError> {
         split_repo(repo)?;
         let route = format!("/repos/{repo}/actions/jobs/{job_id}/logs");
@@ -136,6 +141,7 @@ mod tests {
             let missing = gh.fetch_prs("fpacifici/does-not-exist-xyz", &[]).await;
             assert!(matches!(missing, Err(ApiError::NotFound(_))), "{missing:?}");
             gh.open_prs("ratatui/ratatui").await.unwrap();
+            assert!(!gh.viewer_login().await.unwrap().is_empty());
         });
     }
 }
