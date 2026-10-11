@@ -28,7 +28,8 @@ The main loop in `main.rs` is synchronous and repeats:
    which may return `Effect`s too (e.g. saving autodetected PRs).
 4. **Timers** — `App::tick(now)` returns the polls that are due.
 5. **Effects** — network effects are spawned on the tokio runtime by
-   `worker::Worker`; the rest (config save, clipboard, browser) run inline.
+   `worker::Worker`; the rest (config save, clipboard, browser) run inline,
+   except desktop notifications, which get a thread of their own.
 
 `App` never performs I/O. Everything it wants done is an `Effect`, and
 everything that happened is an `Action` or a `Msg`, so all behaviour —
@@ -39,7 +40,7 @@ without a terminal, network or real clock.
 
 | Module            | Responsibility                                                           | Side effects        |
 |-------------------|--------------------------------------------------------------------------|---------------------|
-| `main.rs`         | Auth + config before the TUI, tokio runtime, main loop, local effects.   | Terminal, files, stdout |
+| `main.rs`         | Auth + config before the TUI, tokio runtime, main loop, local effects.   | Terminal, files, stdout, desktop notifications |
 | `auth.rs`         | Token from `GH_TOKEN` → `GITHUB_TOKEN` → `gh auth token`.                | Runs `gh`           |
 | `config.rs`       | `~/.ghui/config.yaml`: load, create if missing, atomic save, track/untrack/dismiss. | Files (load/save only) |
 | `event.rs`        | `Action` enum, context-free `map_key`.                                    | Reads stdin events  |
@@ -71,13 +72,21 @@ without a terminal, network or real clock.
 
 ## Polling
 
-Only the active tab is polled. Its PRs are re-fetched every 5 s while the
-selected PR has pending checks, every 60 s otherwise (and every 60 s for a
-repo that failed to load). The interval is evaluated on each tick against
-the current selection, so selecting a running PR speeds polling up
-immediately. An open log window for a running Actions job re-fetches the log
+The active tab's PRs are re-fetched every 5 s while the selected PR has
+pending checks, every 60 s otherwise (and every 60 s for a repo that failed
+to load). The interval is evaluated on each tick against the current
+selection, so selecting a running PR speeds polling up immediately.
+Inactive tabs are fetched once at start-up and then every 60 s only while
+one of their PRs has pending checks; switching to a tab refreshes it. An open log window for a running Actions job re-fetches the log
 every 5 s and does one final fetch after the job completes. A rate limit
 pauses all polling until its reset time.
+
+**Check notifications** ([spec 0004](specs/0004-check-notifications.md)):
+`App::handle_prs` compares each PR's new detail with the previous one and
+returns `Effect::Notify` when its checks went from pending to all complete.
+`main.rs` sends it with `notify-rust` on a short-lived thread, so a slow
+notification service never blocks the loop; failures come back as
+`Msg::NotifyFailed` and land in the status bar.
 
 **Autodetect** ([spec 0003](specs/0003-pr-autodetect.md)) rides the same
 `App::tick`: the first tick with a repo configured looks up the user's

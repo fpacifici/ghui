@@ -9,7 +9,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::config::Config;
 use crate::event::Action;
-use crate::github::{ApiError, CheckKind, PrDetail, PrResult, PrSummary};
+use crate::github::{ApiError, CheckKind, CheckState, PrDetail, PrResult, PrSummary};
 use crate::log_view::LogView;
 
 /// Poll interval while the selected PR has pending checks.
@@ -25,13 +25,26 @@ pub const DETECT_POLL: TimeDelta = SLOW_POLL;
 /// Work for the main loop. Network effects come back as a [`Msg`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
-    FetchPrs { repo: String, numbers: Vec<u64> },
-    FetchOpenPrs { repo: String },
+    FetchPrs {
+        repo: String,
+        numbers: Vec<u64>,
+    },
+    FetchOpenPrs {
+        repo: String,
+    },
     FetchViewer,
-    FetchLog { repo: String, job_id: u64 },
+    FetchLog {
+        repo: String,
+        job_id: u64,
+    },
     SaveConfig(Config),
     CopyToClipboard(String),
     OpenUrl(String),
+    /// A desktop notification; see spec 0004.
+    Notify {
+        title: String,
+        body: String,
+    },
 }
 
 /// Results of network effects.
@@ -51,6 +64,8 @@ pub enum Msg {
         job_id: u64,
         result: Result<Option<String>, ApiError>,
     },
+    /// Sending a desktop notification failed.
+    NotifyFailed(String),
 }
 
 /// Rows moved by `PgUp` / `PgDn` in lists.
@@ -143,6 +158,31 @@ impl RepoState {
 
     fn has_loaded(&self) -> bool {
         self.prs.iter().any(|p| p.detail.is_some())
+    }
+
+    fn checks_running(&self) -> bool {
+        self.prs
+            .iter()
+            .any(|p| p.detail.as_ref().is_some_and(PrDetail::checks_running))
+    }
+
+    /// Whether a fetch is due at `now`. Inactive tabs are only polled in
+    /// the background until their first load and while checks run, so
+    /// their completions can still notify.
+    fn poll_due(&self, active: bool, now: DateTime<Utc>) -> bool {
+        if self.in_flight {
+            return false;
+        }
+        let interval = if active {
+            self.poll_interval()
+        } else if self.error.is_none() && (self.last_poll.is_none() || self.checks_running()) {
+            SLOW_POLL
+        } else {
+            return false;
+        };
+        // The interval depends on the selection, so it is evaluated here
+        // rather than when the previous fetch completed.
+        self.force || self.last_poll.is_none_or(|last| now >= last + interval)
     }
 
     fn poll_interval(&self) -> TimeDelta {
@@ -391,7 +431,7 @@ impl App {
     /// Applies the result of a network effect.
     pub fn handle(&mut self, msg: Msg, now: DateTime<Utc>) -> Vec<Effect> {
         match msg {
-            Msg::Prs { repo, result } => self.handle_prs(&repo, result, now),
+            Msg::Prs { repo, result } => return self.handle_prs(&repo, result, now),
             Msg::OpenPrs { repo, result } => {
                 if let Err(ApiError::RateLimited { reset }) = &result {
                     self.rate_limited(*reset, now);
@@ -408,6 +448,7 @@ impl App {
                 return self.autodetect(&repo, result.ok(), now);
             }
             Msg::Viewer(result) => self.handle_viewer(result, now),
+            Msg::NotifyFailed(message) => self.report_error(message),
             Msg::Log {
                 repo,
                 job_id,
@@ -488,14 +529,8 @@ impl App {
             self.status = None;
         }
         let mut effects = Vec::new();
-        if let Some(repo) = self.repos.get_mut(self.active) {
-            // The interval depends on the selected PR, so it is evaluated
-            // here rather than when the previous fetch completed.
-            let due = repo.force
-                || repo
-                    .last_poll
-                    .is_none_or(|last| now >= last + repo.poll_interval());
-            if due && !repo.in_flight {
+        for (i, repo) in self.repos.iter_mut().enumerate() {
+            if repo.poll_due(i == self.active, now) {
                 repo.in_flight = true;
                 repo.force = false;
                 effects.push(Effect::FetchPrs {
@@ -598,11 +633,12 @@ impl App {
         name: &str,
         result: Result<Vec<PrResult>, ApiError>,
         now: DateTime<Utc>,
-    ) {
+    ) -> Vec<Effect> {
         let Some(repo) = self.repos.iter_mut().find(|r| r.name == name) else {
-            return;
+            return Vec::new();
         };
         repo.in_flight = false;
+        let mut effects = Vec::new();
         match result {
             Ok(results) => {
                 repo.error = None;
@@ -613,6 +649,7 @@ impl App {
                     };
                     match result {
                         Ok(detail) => {
+                            effects.extend(checks_finished(name, entry.detail.as_ref(), &detail));
                             entry.detail = Some(detail);
                             entry.error = None;
                         }
@@ -624,7 +661,8 @@ impl App {
             }
             Err(ApiError::RateLimited { reset }) => {
                 repo.last_poll = Some(now);
-                return self.rate_limited(reset, now);
+                self.rate_limited(reset, now);
+                return effects;
             }
             Err(e @ (ApiError::NotFound(_) | ApiError::Forbidden(_))) => repo.error = Some(e),
             Err(e) if !repo.has_loaded() => repo.error = Some(e),
@@ -632,11 +670,14 @@ impl App {
             Err(e) => self.status = Some(format!("{}: refresh failed: {e}", repo.name)),
         }
         repo.last_poll = Some(now);
+        effects
     }
 
     fn switch_repo(&mut self, step: usize) {
         if !self.repos.is_empty() {
             self.active = (self.active + step) % self.repos.len();
+            // Background polls may have left the tab stale.
+            self.repos[self.active].force = true;
         }
     }
 
@@ -699,6 +740,32 @@ fn step(index: usize, delta: isize, len: usize) -> usize {
         return 0;
     }
     index.saturating_add_signed(delta).min(len - 1)
+}
+
+/// The notification for a PR whose checks were running at the previous
+/// poll (`old`) and have all completed now (`new`); see spec 0004.
+fn checks_finished(repo: &str, old: Option<&PrDetail>, new: &PrDetail) -> Option<Effect> {
+    let was_running = old.is_some_and(PrDetail::checks_running);
+    if !was_running || new.checks_running() || new.checks.is_empty() {
+        return None;
+    }
+    let failed = new
+        .checks
+        .iter()
+        .filter(|c| c.state == CheckState::Fail)
+        .count();
+    let pr = format!("{repo} #{} {}", new.number, new.title);
+    Some(if failed == 0 {
+        Effect::Notify {
+            title: "Checks passed".into(),
+            body: pr,
+        }
+    } else {
+        Effect::Notify {
+            title: "Checks failed".into(),
+            body: format!("{pr}\n{failed} of {} checks failed", new.checks.len()),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -772,7 +839,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn first_tick_fetches_every_pr_of_the_active_repo() {
+    fn first_tick_fetches_every_repo() {
         let mut app = App::new(
             config(&[("o/a", &[1, 2]), ("o/b", &[3])]),
             "cfg".into(),
@@ -780,7 +847,11 @@ pub(crate) mod tests {
         );
         assert_eq!(
             app.tick(t(0)),
-            vec![fetch("o/a", &[1, 2]), Effect::FetchViewer]
+            vec![
+                fetch("o/a", &[1, 2]),
+                fetch("o/b", &[3]),
+                Effect::FetchViewer
+            ]
         );
         // Nothing more while the requests are in flight.
         assert!(app.tick(t(10)).is_empty());
@@ -815,6 +886,7 @@ pub(crate) mod tests {
     fn switching_tabs_polls_the_new_repo() {
         let mut app = App::new(config(&[("o/a", &[1]), ("o/b", &[2])]), "cfg".into(), t(0));
         app.tick(t(0));
+        app.handle(loaded("o/b", vec![(2, Ok(detail(2, vec![])))]), t(1));
         app.apply(Action::NextRepo);
         assert_eq!(app.active, 1);
         assert_eq!(app.tick(t(1)), vec![fetch("o/b", &[2])]);
@@ -822,6 +894,142 @@ pub(crate) mod tests {
         assert_eq!(app.active, 0);
         app.apply(Action::PreviousRepo);
         assert_eq!(app.active, 1);
+    }
+
+    #[test]
+    fn inactive_repo_is_polled_slowly_only_while_checks_run() {
+        let mut app = App::new(config(&[("o/a", &[1]), ("o/b", &[2])]), "cfg".into(), t(0));
+        app.tick(t(0));
+        app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(0));
+        let running = detail(2, vec![check("build", CheckState::Pending)]);
+        app.handle(loaded("o/b", vec![(2, Ok(running))]), t(0));
+        assert!(app.tick(t(59)).is_empty());
+        assert_eq!(
+            app.tick(t(60)),
+            vec![fetch("o/a", &[1]), fetch("o/b", &[2])]
+        );
+
+        let done = detail(2, vec![check("build", CheckState::Pass)]);
+        app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(60));
+        app.handle(loaded("o/b", vec![(2, Ok(done))]), t(60));
+        assert_eq!(app.tick(t(120)), vec![fetch("o/a", &[1])]);
+    }
+
+    #[test]
+    fn failed_inactive_repo_is_not_polled_in_the_background() {
+        let mut app = App::new(config(&[("o/a", &[1]), ("o/b", &[2])]), "cfg".into(), t(0));
+        app.tick(t(0));
+        app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(0));
+        let err = ApiError::NotFound("nope".into());
+        app.handle(
+            Msg::Prs {
+                repo: "o/b".into(),
+                result: Err(err),
+            },
+            t(0),
+        );
+        assert_eq!(app.tick(t(60)), vec![fetch("o/a", &[1])]);
+    }
+
+    fn notify(title: &str, body: &str) -> Effect {
+        Effect::Notify {
+            title: title.into(),
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn finished_checks_notify_once() {
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        let running = detail(1, vec![check("build", CheckState::Pending)]);
+        assert!(
+            app.handle(loaded("o/a", vec![(1, Ok(running))]), t(0))
+                .is_empty()
+        );
+        let done = detail(1, vec![check("build", CheckState::Pass)]);
+        assert_eq!(
+            app.handle(loaded("o/a", vec![(1, Ok(done.clone()))]), t(5)),
+            vec![notify("Checks passed", "o/a #1 PR 1")]
+        );
+        assert!(
+            app.handle(loaded("o/a", vec![(1, Ok(done))]), t(10))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_checks_notify_with_the_failure_count() {
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        let running = detail(
+            1,
+            vec![
+                check("build", CheckState::Pending),
+                check("lint", CheckState::Fail),
+                check("test", CheckState::Pass),
+            ],
+        );
+        app.handle(loaded("o/a", vec![(1, Ok(running))]), t(0));
+        let done = detail(
+            1,
+            vec![
+                check("build", CheckState::Fail),
+                check("lint", CheckState::Fail),
+                check("test", CheckState::Pass),
+            ],
+        );
+        assert_eq!(
+            app.handle(loaded("o/a", vec![(1, Ok(done))]), t(5)),
+            vec![notify("Checks failed", "o/a #1 PR 1\n2 of 3 checks failed")]
+        );
+    }
+
+    #[test]
+    fn checks_already_complete_or_absent_do_not_notify() {
+        let mut app = App::new(config(&[("o/a", &[1, 2])]), "cfg".into(), t(0));
+        let done = detail(1, vec![check("build", CheckState::Pass)]);
+        let running = detail(2, vec![check("build", CheckState::Pending)]);
+        app.handle(loaded("o/a", vec![(1, Ok(done)), (2, Ok(running))]), t(0));
+        // PR 2's checks went away (e.g. a push with no workflows).
+        let no_checks = detail(2, vec![]);
+        let done = detail(1, vec![check("build", CheckState::Pass)]);
+        assert!(
+            app.handle(loaded("o/a", vec![(1, Ok(done)), (2, Ok(no_checks))]), t(5))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rerun_notifies_again() {
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        let running = detail(1, vec![check("build", CheckState::Pending)]);
+        let done = detail(1, vec![check("build", CheckState::Pass)]);
+        for (i, d) in [&running, &done, &running].into_iter().enumerate() {
+            app.handle(loaded("o/a", vec![(1, Ok(d.clone()))]), t(i as i64));
+        }
+        assert_eq!(
+            app.handle(loaded("o/a", vec![(1, Ok(done))]), t(5)),
+            vec![notify("Checks passed", "o/a #1 PR 1")]
+        );
+    }
+
+    #[test]
+    fn pr_error_keeps_the_running_state_until_a_later_poll() {
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        let running = detail(1, vec![check("build", CheckState::Pending)]);
+        app.handle(loaded("o/a", vec![(1, Ok(running))]), t(0));
+        app.handle(loaded("o/a", vec![(1, Err("boom".into()))]), t(5));
+        let done = detail(1, vec![check("build", CheckState::Pass)]);
+        assert_eq!(
+            app.handle(loaded("o/a", vec![(1, Ok(done))]), t(10)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn notification_failure_goes_to_the_status_bar() {
+        let mut app = App::new(config(&[]), "cfg".into(), t(0));
+        app.handle(Msg::NotifyFailed("cannot notify: no bus".into()), t(0));
+        assert_eq!(app.status.as_deref(), Some("cannot notify: no bus"));
     }
 
     #[test]
@@ -957,7 +1165,9 @@ pub(crate) mod tests {
     fn untracking_the_last_pr_empties_the_list_and_then_does_nothing() {
         let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
         let effects = app.apply(Action::Untrack);
-        assert_eq!(effects, vec![Effect::SaveConfig(config(&[("o/a", &[])]))]);
+        let mut expected = config(&[("o/a", &[])]);
+        expected.repos[0].dismissed = vec![1];
+        assert_eq!(effects, vec![Effect::SaveConfig(expected)]);
         assert!(app.repos[0].prs.is_empty());
         assert_eq!(app.repos[0].selected_pr, 0);
         assert!(app.apply(Action::Untrack).is_empty());

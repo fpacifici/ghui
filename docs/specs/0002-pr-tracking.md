@@ -68,7 +68,8 @@ statuses.
 - While a tab is active its tracked PRs are re-fetched in that same single
   request: every 5 s while the **selected** PR has pending checks (or has
   not loaded yet), every 60 s once all its checks have completed. Inactive
-  tabs are not polled.
+  tabs are polled in the background only as described in
+  [0004-check-notifications.md](0004-check-notifications.md).
 - A repo that failed to load is retried every 60 s.
 - `r` refreshes the selected PR (and the open log) immediately.
 - When rate limited, polling pauses until the reset time and the status bar
