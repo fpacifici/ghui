@@ -8,12 +8,14 @@ acceptance criteria; implementation details belong in
 |-----------------------------------|-------------|
 | [0001-basic-ui.md](0001-basic-ui.md) | Superseded  |
 | [0002-pr-tracking.md](0002-pr-tracking.md) | Implemented |
-| [0003-pr-autodetect.md](0003-pr-autodetect.md) | Implemented |
+| [0003-pr-autodetect.md](0003-pr-autodetect.md) | Superseded  |
 | [0004-check-notifications.md](0004-check-notifications.md) | Implemented |
-| [0005-auto-untrack-closed.md](0005-auto-untrack-closed.md) | Implemented |
+| [0005-auto-untrack-closed.md](0005-auto-untrack-closed.md) | Superseded  |
 | [0005-enter-opens-browser.md](0005-enter-opens-browser.md) | Implemented |
 | [0006-refresh-all.md](0006-refresh-all.md) | Implemented |
 | [0007-check-tree.md](0007-check-tree.md) | Implemented |
+| [0008-manual-tracking.md](0008-manual-tracking.md) | Implemented |
+| [0009-api-log.md](0009-api-log.md) | Implemented |
 
 ## Template
 

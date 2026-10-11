@@ -7,21 +7,20 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
 
+use crate::api_log::{ApiCall, ApiLog};
 use crate::check_tree::{self, Folds, Node, Row};
 use crate::config::Config;
 use crate::event::Action;
-use crate::github::{ApiError, CheckKind, CheckState, PrDetail, PrResult, PrState, PrSummary};
+use crate::github::{ApiError, CheckKind, CheckState, OpenPrs, PrDetail, PrResult, PrSummary};
 use crate::log_view::LogView;
+use crate::scroll::Scroll;
 
-/// Poll interval while the selected PR has pending checks.
-pub const FAST_POLL: TimeDelta = TimeDelta::seconds(5);
-/// Poll interval once the selected PR's checks have all completed.
-pub const SLOW_POLL: TimeDelta = TimeDelta::seconds(60);
+/// Poll interval of a repo's PRs with pending checks; see spec 0008.
+pub const CHECK_POLL: TimeDelta = TimeDelta::seconds(30);
+/// Retry interval of the active repo when it failed to load.
+pub const RETRY_POLL: TimeDelta = TimeDelta::seconds(60);
 /// Pause after a rate limit without a reset time.
 const RATE_LIMIT_BACKOFF: TimeDelta = TimeDelta::seconds(60);
-/// How often the active repo is checked for new PRs by the user, and the
-/// retry interval for looking up who the user is.
-pub const DETECT_POLL: TimeDelta = SLOW_POLL;
 
 /// Work for the main loop. Network effects come back as a [`Msg`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +34,6 @@ pub enum Effect {
     FetchOpenPrs {
         repo: String,
     },
-    FetchViewer,
     FetchLog {
         repo: String,
         job_id: u64,
@@ -59,9 +57,8 @@ pub enum Msg {
     },
     OpenPrs {
         repo: String,
-        result: Result<Vec<PrSummary>, ApiError>,
+        result: Result<OpenPrs, ApiError>,
     },
-    Viewer(Result<String, ApiError>),
     Log {
         repo: String,
         job_id: u64,
@@ -69,6 +66,8 @@ pub enum Msg {
     },
     /// Sending a desktop notification failed.
     NotifyFailed(String),
+    /// A GitHub API request completed; sent before its result.
+    ApiCall(ApiCall),
 }
 
 /// Rows moved by `PgUp` / `PgDn` in lists.
@@ -79,15 +78,55 @@ const PAGE: isize = 10;
 pub enum Modal {
     Picker(Picker),
     Log(Box<LogView>),
+    /// The API call log ([`App::api_log`]); see spec 0009.
+    ApiLog(Scroll),
 }
 
-/// The add-PR picker: open PRs of `repo`.
+/// The add-PR picker: open PRs of `repo`; see spec 0008.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picker {
     pub repo: String,
     /// `None` while loading.
-    pub items: Option<Result<Vec<PrSummary>, String>>,
+    pub items: Option<Result<OpenPrs, String>>,
+    /// Show the user's PRs rather than all.
+    pub mine: bool,
+    /// Typed digits; only PRs whose number starts with them are shown.
+    pub filter: String,
+    /// Index into [`Picker::visible`].
     pub selected: usize,
+}
+
+impl Picker {
+    fn new(repo: String) -> Self {
+        Self {
+            repo,
+            items: None,
+            mine: true,
+            filter: String::new(),
+            selected: 0,
+        }
+    }
+
+    /// The rows shown: the current listing, filtered by number.
+    pub fn visible(&self) -> Vec<&PrSummary> {
+        let Some(Ok(items)) = &self.items else {
+            return Vec::new();
+        };
+        let list = if self.mine { &items.mine } else { &items.all };
+        list.iter()
+            .filter(|p| p.number.to_string().starts_with(&self.filter))
+            .collect()
+    }
+
+    /// The PR `Enter` tracks: the selected row, or the typed number when
+    /// no row matches.
+    fn target(&self) -> Option<u64> {
+        let visible = self.visible();
+        if visible.is_empty() {
+            return self.filter.parse().ok();
+        }
+        visible.get(self.selected).map(|p| p.number)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -133,12 +172,6 @@ pub struct RepoState {
     force: bool,
     /// When the last fetch completed; `None` means a fetch is due now.
     last_poll: Option<DateTime<Utc>>,
-    /// Autodetect: an open-PR listing is in flight.
-    detect_in_flight: bool,
-    /// Autodetect: when the last open-PR listing completed.
-    last_detect: Option<DateTime<Utc>>,
-    /// Autodetect: list open PRs on the next tick, even when inactive.
-    detect_force: bool,
 }
 
 impl RepoState {
@@ -153,9 +186,6 @@ impl RepoState {
             in_flight: false,
             force: false,
             last_poll: None,
-            detect_in_flight: false,
-            last_detect: None,
-            detect_force: false,
         }
     }
 
@@ -182,45 +212,42 @@ impl RepoState {
         self.prs.iter().any(|p| p.detail.is_some())
     }
 
-    fn checks_running(&self) -> bool {
+    /// The PRs whose checks are still pending.
+    fn pending(&self) -> Vec<u64> {
         self.prs
             .iter()
-            .any(|p| p.detail.as_ref().is_some_and(PrDetail::checks_running))
+            .filter(|p| p.detail.as_ref().is_some_and(PrDetail::checks_running))
+            .map(|p| p.number)
+            .collect()
     }
 
-    /// Whether a fetch is due at `now`. Inactive tabs are only polled in
-    /// the background until their first load and while checks run, so
-    /// their completions can still notify, or when refreshed by hand.
+    /// Whether every PR must be fetched rather than the pending ones:
+    /// first load, retries and manual refreshes.
+    fn full_fetch(&self) -> bool {
+        self.force || self.last_poll.is_none() || self.error.is_some()
+    }
+
+    /// Whether a fetch is due at `now`. After the first load, a repo is
+    /// polled every [`CHECK_POLL`] while it has pending checks, active or
+    /// not; a failed one is retried while active. See spec 0008.
     fn poll_due(&self, active: bool, now: DateTime<Utc>) -> bool {
         if self.in_flight {
             return false;
         }
-        if self.force {
+        let Some(last) = self.last_poll.filter(|_| !self.force) else {
             return true;
-        }
-        let interval = if active {
-            self.poll_interval()
-        } else if self.error.is_none() && (self.last_poll.is_none() || self.checks_running()) {
-            SLOW_POLL
-        } else {
-            return false;
         };
-        // The interval depends on the selection, so it is evaluated here
-        // rather than when the previous fetch completed.
-        self.last_poll.is_none_or(|last| now >= last + interval)
-    }
-
-    fn poll_interval(&self) -> TimeDelta {
-        if self.error.is_some() {
-            return SLOW_POLL;
-        }
-        match self.selected() {
-            Some(pr) => match &pr.detail {
-                Some(detail) if !detail.checks_running() => SLOW_POLL,
-                _ => FAST_POLL,
-            },
-            None => SLOW_POLL,
-        }
+        let interval = if self.error.is_some() {
+            if !active {
+                return false;
+            }
+            RETRY_POLL
+        } else if self.pending().is_empty() {
+            return false;
+        } else {
+            CHECK_POLL
+        };
+        now >= last + interval
     }
 
     /// Drops the PRs `numbers`. The selected PR stays selected; if it is
@@ -294,15 +321,6 @@ impl RepoState {
     }
 }
 
-/// The authenticated user, looked up once for autodetect.
-#[derive(Debug, Default)]
-struct Viewer {
-    login: Option<String>,
-    in_flight: bool,
-    /// When the last failed lookup completed.
-    last_attempt: Option<DateTime<Utc>>,
-}
-
 /// All state of the application.
 #[derive(Debug)]
 pub struct App {
@@ -325,7 +343,8 @@ pub struct App {
     pub running: bool,
     /// A manual refresh (`r`) has PR fetches pending; shown in the tab bar.
     pub refreshing: bool,
-    viewer: Viewer,
+    /// Every GitHub API call of the session; see spec 0009.
+    pub api_log: ApiLog,
 }
 
 impl App {
@@ -348,7 +367,7 @@ impl App {
             now,
             running: true,
             refreshing: false,
-            viewer: Viewer::default(),
+            api_log: ApiLog::default(),
         }
     }
 
@@ -401,6 +420,7 @@ impl App {
             Action::PageUp => self.move_selection(-PAGE),
             Action::PageDown => self.move_selection(PAGE),
             Action::AddPr => return self.open_picker(),
+            Action::ApiLog => self.modal = Some(Modal::ApiLog(Scroll::default())),
             Action::Enter => match self.focus {
                 Focus::List => {
                     if let Some(url) = self.selected_pr_url() {
@@ -409,7 +429,8 @@ impl App {
                 }
                 Focus::Checks => return self.enter_check(),
             },
-            Action::Close => {}
+            // Picker-only keys.
+            Action::Close | Action::ToggleMine | Action::Digit(_) | Action::Backspace => {}
         }
         Vec::new()
     }
@@ -422,10 +443,6 @@ impl App {
         }
         match modal {
             Modal::Picker(mut picker) => {
-                let len = match &picker.items {
-                    Some(Ok(items)) => items.len(),
-                    _ => 0,
-                };
                 let delta = match action {
                     Action::Up => -1,
                     Action::Down => 1,
@@ -434,8 +451,24 @@ impl App {
                     Action::Top => isize::MIN,
                     Action::Bottom => isize::MAX,
                     Action::Enter => return self.pick(picker),
+                    Action::ToggleMine => {
+                        picker.mine = !picker.mine;
+                        picker.selected = 0;
+                        0
+                    }
+                    Action::Digit(d) => {
+                        picker.filter.push(char::from(b'0' + d));
+                        picker.selected = 0;
+                        0
+                    }
+                    Action::Backspace => {
+                        picker.filter.pop();
+                        picker.selected = 0;
+                        0
+                    }
                     _ => 0,
                 };
+                let len = picker.visible().len();
                 picker.selected = step(picker.selected, delta, len);
                 self.modal = Some(Modal::Picker(picker));
             }
@@ -464,6 +497,23 @@ impl App {
                 }
                 self.modal = Some(Modal::Log(log));
                 return effects;
+            }
+            Modal::ApiLog(mut scroll) => {
+                let height = self.log_height.max(1);
+                let page = isize::try_from(height).unwrap_or(isize::MAX);
+                let delta = match action {
+                    Action::Up => -1,
+                    Action::Down => 1,
+                    Action::PageUp => -page,
+                    Action::PageDown => page,
+                    Action::Top => isize::MIN,
+                    Action::Bottom => isize::MAX,
+                    _ => 0,
+                };
+                if delta != 0 {
+                    scroll.scroll_by(delta, self.api_log.len(), height);
+                }
+                self.modal = Some(Modal::ApiLog(scroll));
             }
         }
         Vec::new()
@@ -528,21 +578,15 @@ impl App {
             return Vec::new();
         };
         let repo = repo.name.clone();
-        self.modal = Some(Modal::Picker(Picker {
-            repo: repo.clone(),
-            items: None,
-            selected: 0,
-        }));
+        self.modal = Some(Modal::Picker(Picker::new(repo.clone())));
         vec![Effect::FetchOpenPrs { repo }]
     }
 
-    /// Tracks the PR under the cursor, closes the picker and selects it.
-    /// Already tracked PRs leave the picker open.
+    /// Tracks the PR under the cursor, or the typed number when no row
+    /// matches, closes the picker and selects it. Already tracked PRs leave
+    /// the picker open.
     fn pick(&mut self, picker: Picker) -> Vec<Effect> {
-        let number = match &picker.items {
-            Some(Ok(items)) => items.get(picker.selected).map(|p| p.number),
-            _ => None,
-        };
+        let number = picker.target();
         let Some(repo) = self.repos.iter_mut().find(|r| r.name == picker.repo) else {
             return Vec::new();
         };
@@ -574,19 +618,18 @@ impl App {
                 if let Err(ApiError::RateLimited { reset }) = &result {
                     self.rate_limited(*reset, now);
                 }
-                // Autodetect and the picker share the listing; a picker that
-                // already shows PRs is not reset under the cursor.
+                // A picker that already shows PRs is not reset under the
+                // cursor.
                 if let Some(Modal::Picker(picker)) = &mut self.modal
                     && picker.repo == repo
                     && !matches!(picker.items, Some(Ok(_)))
                 {
-                    picker.items = Some(result.clone().map_err(|e| e.to_string()));
+                    picker.items = Some(result.map_err(|e| e.to_string()));
                     picker.selected = 0;
                 }
-                return self.autodetect(&repo, result.ok(), now);
             }
-            Msg::Viewer(result) => self.handle_viewer(result, now),
             Msg::NotifyFailed(message) => self.report_error(message),
+            Msg::ApiCall(call) => self.api_log.push(call),
             Msg::Log {
                 repo,
                 job_id,
@@ -606,56 +649,6 @@ impl App {
         Vec::new()
     }
 
-    fn handle_viewer(&mut self, result: Result<String, ApiError>, now: DateTime<Utc>) {
-        self.viewer.in_flight = false;
-        match result {
-            Ok(login) => self.viewer.login = Some(login),
-            Err(e) => {
-                self.viewer.last_attempt = Some(now);
-                match e {
-                    ApiError::RateLimited { reset } => self.rate_limited(reset, now),
-                    e => self.status = Some(format!("cannot detect your PRs: {e}")),
-                }
-            }
-        }
-    }
-
-    /// Tracks the open PRs of `name` authored by the user that are neither
-    /// tracked nor dismissed. `prs` is `None` when the listing failed.
-    fn autodetect(
-        &mut self,
-        name: &str,
-        prs: Option<Vec<PrSummary>>,
-        now: DateTime<Utc>,
-    ) -> Vec<Effect> {
-        let Some(repo) = self.repos.iter_mut().find(|r| r.name == name) else {
-            return Vec::new();
-        };
-        repo.detect_in_flight = false;
-        repo.last_detect = Some(now);
-        let (Some(login), Some(prs)) = (&self.viewer.login, prs) else {
-            return Vec::new();
-        };
-        let mut new: Vec<u64> = prs
-            .iter()
-            .filter(|p| p.author.eq_ignore_ascii_case(login))
-            .map(|p| p.number)
-            .filter(|n| !repo.prs.iter().any(|p| p.number == *n))
-            .filter(|n| !self.config.is_dismissed(name, *n))
-            .collect();
-        if new.is_empty() {
-            return Vec::new();
-        }
-        new.sort_unstable();
-        new.dedup();
-        for number in new {
-            repo.prs.push(PrEntry::new(number));
-            self.config.track(name, number);
-        }
-        repo.force = true;
-        vec![Effect::SaveConfig(self.config.clone())]
-    }
-
     /// Advances the clock and returns the polls that are due.
     pub fn tick(&mut self, now: DateTime<Utc>) -> Vec<Effect> {
         self.now = now;
@@ -673,65 +666,27 @@ impl App {
         for (i, repo) in self.repos.iter_mut().enumerate() {
             let active = i == self.active;
             if repo.poll_due(active, now) {
+                let numbers = if repo.full_fetch() {
+                    repo.prs.iter().map(|p| p.number).collect()
+                } else {
+                    repo.pending()
+                };
                 repo.in_flight = true;
                 repo.force = false;
+                // Steps are costly, so only the PR on screen gets them.
+                let steps = repo
+                    .selected()
+                    .map(|p| p.number)
+                    .filter(|n| active && numbers.contains(n));
                 effects.push(Effect::FetchPrs {
                     repo: repo.name.clone(),
-                    numbers: repo.prs.iter().map(|p| p.number).collect(),
-                    // Steps are costly, so only the PR on screen gets them.
-                    steps: repo.selected().filter(|_| active).map(|p| p.number),
+                    numbers,
+                    steps,
                 });
             }
         }
-        effects.extend(self.tick_viewer(now));
-        effects.extend(self.tick_detect(now));
         effects.extend(self.tick_log(now));
         effects
-    }
-
-    /// Looks up the user's login once, retrying failures every
-    /// [`DETECT_POLL`]. Not needed until there is a repo to check.
-    fn tick_viewer(&mut self, now: DateTime<Utc>) -> Option<Effect> {
-        let viewer = &mut self.viewer;
-        let due = viewer.login.is_none()
-            && !viewer.in_flight
-            && !self.repos.is_empty()
-            && viewer
-                .last_attempt
-                .is_none_or(|last| now >= last + DETECT_POLL);
-        if !due {
-            return None;
-        }
-        viewer.in_flight = true;
-        Some(Effect::FetchViewer)
-    }
-
-    /// Lists the active repo's open PRs every [`DETECT_POLL`] once the
-    /// user's login is known, so their new PRs get tracked; and any repo's
-    /// right away after a manual refresh.
-    fn tick_detect(&mut self, now: DateTime<Utc>) -> Vec<Effect> {
-        if self.viewer.login.is_none() {
-            return Vec::new();
-        }
-        let active = self.active;
-        self.repos
-            .iter_mut()
-            .enumerate()
-            .filter(|(i, repo)| {
-                let scheduled = *i == active
-                    && repo
-                        .last_detect
-                        .is_none_or(|last| now >= last + DETECT_POLL);
-                repo.error.is_none() && !repo.detect_in_flight && (repo.detect_force || scheduled)
-            })
-            .map(|(_, repo)| {
-                repo.detect_in_flight = true;
-                repo.detect_force = false;
-                Effect::FetchOpenPrs {
-                    repo: repo.name.clone(),
-                }
-            })
-            .collect()
     }
 
     fn rate_limited(&mut self, reset: Option<DateTime<Utc>>, now: DateTime<Utc>) {
@@ -796,7 +751,6 @@ impl App {
         match result {
             Ok(results) => {
                 repo.error = None;
-                let mut closed = Vec::new();
                 for (number, result) in results {
                     // PRs untracked while the request was in flight are skipped.
                     let Some(entry) = repo.prs.iter_mut().find(|p| p.number == number) else {
@@ -805,9 +759,6 @@ impl App {
                     match result {
                         Ok(detail) => {
                             effects.extend(checks_finished(name, entry.detail.as_ref(), &detail));
-                            if detail.state != PrState::Open {
-                                closed.push(number);
-                            }
                             entry.detail = Some(detail);
                             entry.error = None;
                         }
@@ -816,12 +767,11 @@ impl App {
                 }
                 repo.clamp_selection();
                 self.status = None;
-                if !closed.is_empty() {
-                    effects.push(self.untrack_closed(repo_index, &closed));
-                }
             }
             Err(ApiError::RateLimited { reset }) => {
                 repo.last_poll = Some(now);
+                // Retry everything once the limit resets.
+                repo.force = true;
                 self.rate_limited(reset, now);
                 return effects;
             }
@@ -834,31 +784,11 @@ impl App {
         effects
     }
 
-    /// Drops merged and closed PRs from a tab and the config without
-    /// dismissing them; see spec 0005.
-    fn untrack_closed(&mut self, repo_index: usize, numbers: &[u64]) -> Effect {
-        let repo = &mut self.repos[repo_index];
-        repo.remove_prs(numbers);
-        for number in numbers {
-            self.config.remove(&repo.name, *number);
-        }
-        let list: Vec<String> = numbers.iter().map(|n| format!("#{n}")).collect();
-        self.status = Some(format!(
-            "{}: untracked closed {}",
-            repo.name,
-            list.join(", ")
-        ));
-        Effect::SaveConfig(self.config.clone())
-    }
-
-    /// `r`: re-fetches every tab, which drops merged and closed PRs, and
-    /// lists every tab's open PRs, which adds the user's new ones; see
-    /// spec 0006.
+    /// `r`: re-fetches every PR of every tab; see specs 0006 and 0008.
     fn refresh_all(&mut self) {
         self.refreshing = !self.repos.is_empty();
         for repo in &mut self.repos {
             repo.force = true;
-            repo.detect_force = true;
         }
     }
 
@@ -974,7 +904,6 @@ pub(crate) mod tests {
                 .map(|(name, prs)| RepoConfig {
                     name: name.to_string(),
                     prs: prs.to_vec(),
-                    dismissed: vec![],
                 })
                 .collect(),
         }
@@ -1054,29 +983,43 @@ pub(crate) mod tests {
         );
         assert_eq!(
             app.tick(t(0)),
-            vec![
-                fetch("o/a", &[1, 2]),
-                fetch_bg("o/b", &[3]),
-                Effect::FetchViewer
-            ]
+            vec![fetch("o/a", &[1, 2]), fetch_bg("o/b", &[3])]
         );
         // Nothing more while the requests are in flight.
         assert!(app.tick(t(10)).is_empty());
     }
 
     #[test]
-    fn polls_fast_while_checks_run_and_slow_after() {
-        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+    fn only_pending_prs_are_polled_every_30_s_until_done() {
+        let mut app = App::new(config(&[("o/a", &[1, 2])]), "cfg".into(), t(0));
         app.tick(t(0));
         let running = detail(1, vec![check("build", CheckState::Pending)]);
-        app.handle(loaded("o/a", vec![(1, Ok(running))]), t(1));
-        assert!(app.tick(t(5)).is_empty());
-        assert_eq!(app.tick(t(6)), vec![fetch("o/a", &[1])]);
+        let done = detail(2, vec![check("build", CheckState::Pass)]);
+        app.handle(loaded("o/a", vec![(1, Ok(running)), (2, Ok(done))]), t(1));
+        assert!(app.tick(t(30)).is_empty());
+        assert_eq!(app.tick(t(31)), vec![fetch("o/a", &[1])]);
 
-        let done = detail(1, vec![check("build", CheckState::Pass)]);
-        app.handle(loaded("o/a", vec![(1, Ok(done))]), t(7));
-        assert!(app.tick(t(66)).is_empty());
-        assert_eq!(app.tick(t(67)), vec![fetch("o/a", &[1])]);
+        let finished = detail(1, vec![check("build", CheckState::Pass)]);
+        app.handle(loaded("o/a", vec![(1, Ok(finished))]), t(32));
+        assert!(app.tick(t(10_000)).is_empty());
+    }
+
+    #[test]
+    fn pending_poll_fetches_steps_only_for_a_selected_pending_pr() {
+        let mut app = App::new(config(&[("o/a", &[1, 2])]), "cfg".into(), t(0));
+        app.tick(t(0));
+        let running = detail(1, vec![check("build", CheckState::Pending)]);
+        let done = detail(2, vec![check("build", CheckState::Pass)]);
+        app.handle(
+            loaded("o/a", vec![(1, Ok(running.clone())), (2, Ok(done))]),
+            t(1),
+        );
+        app.apply(Action::Down);
+        // Selecting fetches the whole tab, with the new selection's steps.
+        assert_eq!(app.tick(t(2)), vec![fetch_with("o/a", &[1, 2], Some(2))]);
+        let done = detail(2, vec![check("build", CheckState::Pass)]);
+        app.handle(loaded("o/a", vec![(1, Ok(running)), (2, Ok(done))]), t(3));
+        assert_eq!(app.tick(t(33)), vec![fetch_with("o/a", &[1], None)]);
     }
 
     #[test]
@@ -1104,26 +1047,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn inactive_repo_is_polled_slowly_only_while_checks_run() {
+    fn inactive_repo_is_polled_while_checks_run() {
         let mut app = App::new(config(&[("o/a", &[1]), ("o/b", &[2])]), "cfg".into(), t(0));
         app.tick(t(0));
         app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(0));
         let running = detail(2, vec![check("build", CheckState::Pending)]);
         app.handle(loaded("o/b", vec![(2, Ok(running))]), t(0));
-        assert!(app.tick(t(59)).is_empty());
-        assert_eq!(
-            app.tick(t(60)),
-            vec![fetch("o/a", &[1]), fetch_bg("o/b", &[2])]
-        );
+        assert!(app.tick(t(29)).is_empty());
+        assert_eq!(app.tick(t(30)), vec![fetch_bg("o/b", &[2])]);
 
         let done = detail(2, vec![check("build", CheckState::Pass)]);
-        app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(60));
-        app.handle(loaded("o/b", vec![(2, Ok(done))]), t(60));
-        assert_eq!(app.tick(t(120)), vec![fetch("o/a", &[1])]);
+        let effects = app.handle(loaded("o/b", vec![(2, Ok(done))]), t(30));
+        assert_eq!(effects, vec![notify("Checks passed", "o/b #2 PR 2")]);
+        assert!(app.tick(t(10_000)).is_empty());
     }
 
     #[test]
-    fn refresh_refetches_every_tab_and_drops_closed_prs() {
+    fn refresh_refetches_every_tab_and_keeps_closed_prs() {
         let mut app = App::new(
             config(&[("o/a", &[1]), ("o/b", &[2, 3])]),
             "cfg".into(),
@@ -1133,9 +1073,8 @@ pub(crate) mod tests {
         app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(0));
         let open = vec![(2, Ok(detail(2, vec![]))), (3, Ok(detail(3, vec![])))];
         app.handle(loaded("o/b", open), t(0));
-        // A quiet inactive tab is not polled by itself...
-        assert_eq!(app.tick(t(1000)), vec![fetch("o/a", &[1])]);
-        app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(1000));
+        // Quiet tabs are not polled by themselves...
+        assert!(app.tick(t(1000)).is_empty());
         // ...but `r` refreshes every tab.
         app.apply(Action::Refresh);
         assert!(app.refreshing);
@@ -1154,11 +1093,8 @@ pub(crate) mod tests {
             ),
             t(1002),
         );
-        assert_eq!(
-            effects,
-            vec![Effect::SaveConfig(config(&[("o/a", &[1]), ("o/b", &[3])]))]
-        );
-        assert!(!app.is_tracked("o/b", 2));
+        assert!(effects.is_empty());
+        assert!(app.is_tracked("o/b", 2));
         app.tick(t(1002));
         assert!(app.refreshing, "o/a is still in flight");
         app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(1002));
@@ -1196,12 +1132,7 @@ pub(crate) mod tests {
             },
             t(0),
         );
-        assert_eq!(app.tick(t(60)), vec![fetch("o/a", &[1])]);
-        assert!(
-            app.tick(t(1000))
-                .iter()
-                .all(|e| *e != fetch_bg("o/b", &[2]))
-        );
+        assert!(app.tick(t(1000)).is_empty());
     }
 
     fn notify(title: &str, body: &str) -> Effect {
@@ -1358,7 +1289,8 @@ pub(crate) mod tests {
         );
         assert!(app.status.as_deref().unwrap().contains("Rate limited"));
         assert!(app.tick(t(99)).is_empty());
-        assert_eq!(app.tick(t(100)).len(), 1);
+        // The whole tab is fetched again, whatever was pending.
+        assert_eq!(app.tick(t(100)), vec![fetch("o/a", &[1])]);
         assert_eq!(app.status, None);
     }
 
@@ -1400,26 +1332,6 @@ pub(crate) mod tests {
         assert_eq!(app.repos[0].selected_pr, 0);
         app.apply(Action::Bottom);
         assert_eq!(app.repos[0].selected_pr, 1);
-    }
-
-    #[test]
-    fn selecting_a_running_pr_switches_to_the_fast_poll() {
-        let mut app = App::new(config(&[("o/a", &[1, 2])]), "cfg".into(), t(0));
-        app.tick(t(0));
-        let done = vec![check("a", CheckState::Pass), check("b", CheckState::Pass)];
-        let running = vec![check("c", CheckState::Pending)];
-        app.handle(
-            loaded(
-                "o/a",
-                vec![(1, Ok(detail(1, done))), (2, Ok(detail(2, running)))],
-            ),
-            t(1),
-        );
-        assert!(app.tick(t(6)).is_empty());
-        app.repos[0].selected_check = 1;
-        app.apply(Action::Down);
-        assert_eq!(app.repos[0].selected_check, 0);
-        assert_eq!(app.tick(t(6)).len(), 1);
     }
 
     /// PR 1 with run 7: a failed `lint` job and a running `test` job, both
@@ -1573,74 +1485,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn closed_and_merged_prs_are_untracked_without_dismissal() {
-        let mut app = App::new(config(&[("o/a", &[1, 2, 3, 4])]), "cfg".into(), t(0));
-        // Select #4 on its second check.
-        app.repos[0].selected_pr = 3;
-        app.repos[0].selected_check = 1;
-        app.tick(t(0));
-        let checks = vec![check("a", CheckState::Pass), check("b", CheckState::Pass)];
-        let effects = app.handle(
-            loaded(
-                "o/a",
-                vec![
-                    (1, Ok(with_state(1, PrState::Merged, vec![]))),
-                    (2, Ok(detail(2, vec![]))),
-                    (3, Ok(with_state(3, PrState::Closed, vec![]))),
-                    (4, Ok(detail(4, checks))),
-                ],
-            ),
-            t(1),
-        );
-        assert_eq!(
-            effects,
-            vec![Effect::SaveConfig(config(&[("o/a", &[2, 4])]))]
-        );
-        let numbers: Vec<u64> = app.repos[0].prs.iter().map(|p| p.number).collect();
-        assert_eq!(numbers, vec![2, 4]);
-        assert_eq!(app.repos[0].selected().unwrap().number, 4);
-        assert_eq!(app.repos[0].selected_check, 1);
-        assert!(!app.config.is_dismissed("o/a", 1));
-        assert_eq!(app.status.as_deref(), Some("o/a: untracked closed #1, #3"));
-        // The next poll only asks for the open PRs.
-        app.apply(Action::Refresh);
-        assert_eq!(app.tick(t(2)), vec![fetch_with("o/a", &[2, 4], Some(4))]);
-    }
-
-    #[test]
-    fn closing_the_selected_pr_keeps_the_row_and_resets_the_check() {
+    fn closed_and_merged_prs_stay_tracked_and_still_notify() {
         let mut app = App::new(config(&[("o/a", &[1, 2])]), "cfg".into(), t(0));
-        app.repos[0].selected_pr = 1;
-        app.repos[0].selected_check = 1;
-        let checks = vec![check("a", CheckState::Pass), check("b", CheckState::Pass)];
-        app.handle(
-            loaded(
-                "o/a",
-                vec![
-                    (1, Ok(detail(1, checks))),
-                    (2, Ok(with_state(2, PrState::Merged, vec![]))),
-                ],
-            ),
-            t(0),
-        );
-        assert_eq!(app.repos[0].selected().unwrap().number, 1);
-        assert_eq!(app.repos[0].selected_check, 0);
-    }
-
-    #[test]
-    fn a_pr_merged_as_its_checks_finish_still_notifies() {
-        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        app.tick(t(0));
         let running = detail(1, vec![check("build", CheckState::Pending)]);
-        app.handle(loaded("o/a", vec![(1, Ok(running))]), t(0));
+        let closed = with_state(2, PrState::Closed, vec![]);
+        app.handle(loaded("o/a", vec![(1, Ok(running)), (2, Ok(closed))]), t(0));
         let merged = with_state(1, PrState::Merged, vec![check("build", CheckState::Pass)]);
         assert_eq!(
-            app.handle(loaded("o/a", vec![(1, Ok(merged))]), t(5)),
-            vec![
-                notify("Checks passed", "o/a #1 PR 1"),
-                Effect::SaveConfig(config(&[("o/a", &[])]))
-            ]
+            app.handle(loaded("o/a", vec![(1, Ok(merged))]), t(30)),
+            vec![notify("Checks passed", "o/a #1 PR 1")]
         );
-        assert!(app.repos[0].prs.is_empty());
+        assert!(app.is_tracked("o/a", 1));
+        assert!(app.is_tracked("o/a", 2));
+        assert_eq!(app.config, config(&[("o/a", &[1, 2])]));
+        assert_eq!(app.status, None);
     }
 
     #[test]
@@ -1648,9 +1507,7 @@ pub(crate) mod tests {
         let mut app = App::new(config(&[("o/a", &[1, 2])]), "cfg".into(), t(0));
         app.apply(Action::Down);
         let effects = app.apply(Action::Untrack);
-        let mut expected = config(&[("o/a", &[1])]);
-        expected.repos[0].dismissed = vec![2];
-        assert_eq!(effects, vec![Effect::SaveConfig(expected)]);
+        assert_eq!(effects, vec![Effect::SaveConfig(config(&[("o/a", &[1])]))]);
         assert_eq!(app.repos[0].prs.len(), 1);
         assert_eq!(app.repos[0].selected_pr, 0);
     }
@@ -1659,9 +1516,7 @@ pub(crate) mod tests {
     fn untracking_the_last_pr_empties_the_list_and_then_does_nothing() {
         let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
         let effects = app.apply(Action::Untrack);
-        let mut expected = config(&[("o/a", &[])]);
-        expected.repos[0].dismissed = vec![1];
-        assert_eq!(effects, vec![Effect::SaveConfig(expected)]);
+        assert_eq!(effects, vec![Effect::SaveConfig(config(&[("o/a", &[])]))]);
         assert!(app.repos[0].prs.is_empty());
         assert_eq!(app.repos[0].selected_pr, 0);
         assert!(app.apply(Action::Untrack).is_empty());
@@ -1735,207 +1590,33 @@ pub(crate) mod tests {
         assert!(!app.running);
     }
 
-    fn by(author: &str, number: u64) -> PrSummary {
-        PrSummary {
-            number,
-            title: format!("open {number}"),
-            author: author.into(),
-            is_draft: false,
-        }
-    }
-
-    fn open_prs(repo: &str, prs: Vec<PrSummary>) -> Msg {
-        Msg::OpenPrs {
-            repo: repo.into(),
-            result: Ok(prs),
-        }
-    }
-
-    fn list_open(repo: &str) -> Effect {
-        Effect::FetchOpenPrs { repo: repo.into() }
-    }
-
-    /// An app whose first PR poll and login lookup ("me") are done.
-    fn detecting_app(repos: &[(&str, &[u64])]) -> App {
-        let mut app = App::new(config(repos), "cfg".into(), t(0));
+    #[test]
+    fn nothing_is_listed_in_the_background() {
+        let mut app = App::new(config(&[("o/a", &[]), ("o/b", &[])]), "cfg".into(), t(0));
         app.tick(t(0));
-        app.handle(Msg::Viewer(Ok("me".into())), t(0));
-        app
-    }
-
-    #[test]
-    fn login_is_looked_up_once_and_retried_on_failure() {
-        let mut app = App::new(config(&[("o/a", &[])]), "cfg".into(), t(0));
-        assert!(app.tick(t(0)).contains(&Effect::FetchViewer));
-        assert!(!app.tick(t(1)).contains(&Effect::FetchViewer));
-        app.handle(Msg::Viewer(Err(ApiError::Network("down".into()))), t(1));
-        assert!(app.status.as_deref().unwrap().contains("down"));
-        assert!(!app.tick(t(60)).contains(&Effect::FetchViewer));
-        assert!(app.tick(t(61)).contains(&Effect::FetchViewer));
-        app.handle(Msg::Viewer(Ok("me".into())), t(62));
-        assert!(!app.tick(t(1000)).contains(&Effect::FetchViewer));
-    }
-
-    #[test]
-    fn no_login_lookup_without_repos() {
-        let mut app = App::new(Config::default(), "cfg".into(), t(0));
-        assert!(app.tick(t(0)).is_empty());
-    }
-
-    #[test]
-    fn detection_lists_the_active_repo_every_minute() {
-        let mut app = detecting_app(&[("o/a", &[]), ("o/b", &[])]);
-        assert_eq!(app.tick(t(1)), vec![list_open("o/a")]);
-        // Nothing more while the listing is in flight.
-        assert!(app.tick(t(2)).is_empty());
-        app.handle(open_prs("o/a", vec![]), t(2));
-        assert!(app.tick(t(61)).is_empty());
-        assert_eq!(app.tick(t(62)), vec![list_open("o/a")]);
-
-        // Only the active tab is checked.
-        app.handle(open_prs("o/a", vec![]), t(63));
-        app.apply(Action::NextRepo);
-        assert!(app.tick(t(64)).contains(&list_open("o/b")));
-        assert!(!app.tick(t(200)).contains(&list_open("o/a")));
-    }
-
-    #[test]
-    fn refresh_detects_new_prs_in_every_tab_once() {
-        let mut app = detecting_app(&[("o/a", &[]), ("o/b", &[])]);
         app.handle(loaded("o/a", vec![]), t(0));
         app.handle(loaded("o/b", vec![]), t(0));
-        app.tick(t(1));
-        app.handle(open_prs("o/a", vec![]), t(1));
-        assert!(app.tick(t(2)).is_empty());
-
         app.apply(Action::Refresh);
-        let effects = app.tick(t(2));
-        assert!(effects.contains(&list_open("o/a")), "{effects:?}");
-        assert!(effects.contains(&list_open("o/b")), "{effects:?}");
-        app.handle(open_prs("o/a", vec![]), t(3));
-        let effects = app.handle(open_prs("o/b", vec![by("me", 4)]), t(3));
-        assert_eq!(
-            effects,
-            vec![Effect::SaveConfig(config(&[("o/a", &[]), ("o/b", &[4])]))]
-        );
-        assert_eq!(app.active, 0);
-        // The new PR is fetched right away, in the background, and the
-        // inactive tab is not listed again.
-        app.handle(loaded("o/a", vec![]), t(3));
-        app.handle(loaded("o/b", vec![]), t(3));
-        let effects = app.tick(t(4));
-        assert!(effects.contains(&fetch_bg("o/b", &[4])), "{effects:?}");
-        assert!(!effects.contains(&list_open("o/b")), "{effects:?}");
+        let effects = app.tick(t(1));
+        assert_eq!(effects, vec![fetch("o/a", &[]), fetch_bg("o/b", &[])]);
+        assert!(app.tick(t(10_000)).is_empty());
     }
 
     #[test]
-    fn detection_waits_for_the_login_and_skips_failed_repos() {
+    fn a_late_listing_does_not_reset_the_open_picker() {
         let mut app = App::new(config(&[("o/a", &[])]), "cfg".into(), t(0));
-        app.tick(t(0));
-        assert!(!app.tick(t(100)).contains(&list_open("o/a")));
-        app.handle(
-            Msg::Prs {
-                repo: "o/a".into(),
-                result: Err(ApiError::NotFound("nope".into())),
-            },
-            t(100),
-        );
-        app.handle(Msg::Viewer(Ok("me".into())), t(100));
-        assert!(!app.tick(t(101)).contains(&list_open("o/a")));
-    }
-
-    #[test]
-    fn detection_tracks_the_users_new_prs_and_saves() {
-        let mut app = detecting_app(&[("o/a", &[1])]);
-        app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(0));
-        app.tick(t(1));
-        let effects = app.handle(
-            open_prs(
-                "o/a",
-                vec![by("me", 9), by("other", 5), by("ME", 1), by("Me", 7)],
-            ),
-            t(1),
-        );
-        assert_eq!(
-            effects,
-            vec![Effect::SaveConfig(config(&[("o/a", &[1, 7, 9])]))]
-        );
-        let numbers: Vec<u64> = app.repos[0].prs.iter().map(|p| p.number).collect();
-        assert_eq!(numbers, vec![1, 7, 9]);
-        // The selection stays put and the new PRs are fetched right away.
-        assert_eq!(app.repos[0].selected_pr, 0);
-        assert_eq!(app.tick(t(2)), vec![fetch("o/a", &[1, 7, 9])]);
-
-        // Nothing new: nothing to save.
-        app.tick(t(100));
-        assert!(
-            app.handle(open_prs("o/a", vec![by("me", 9)]), t(100))
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn untracked_prs_are_not_detected_again_until_picked() {
-        let mut app = detecting_app(&[("o/a", &[1, 2])]);
-        app.apply(Action::Down);
-        app.apply(Action::Untrack);
-        assert!(app.config.is_dismissed("o/a", 2));
-        app.tick(t(1));
-        assert!(
-            app.handle(open_prs("o/a", vec![by("me", 2)]), t(1))
-                .is_empty()
-        );
-        assert!(!app.is_tracked("o/a", 2));
-
-        // Picking it again tracks it and clears the dismissal.
-        open_picker_with(&mut app, &[2]);
-        assert_eq!(
-            app.apply(Action::Enter),
-            vec![Effect::SaveConfig(config(&[("o/a", &[1, 2])]))]
-        );
-    }
-
-    #[test]
-    fn dismissals_from_the_config_are_respected() {
-        let mut cfg = config(&[("o/a", &[])]);
-        cfg.repos[0].dismissed = vec![4];
-        let mut app = App::new(cfg, "cfg".into(), t(0));
-        app.handle(Msg::Viewer(Ok("me".into())), t(0));
-        assert!(
-            app.handle(open_prs("o/a", vec![by("me", 4)]), t(0))
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn opening_the_picker_also_detects_and_marks_rows_tracked() {
-        let mut app = detecting_app(&[("o/a", &[])]);
-        open_picker_with(&mut app, &[]);
-        app.apply(Action::Close);
-        app.apply(Action::AddPr);
-        let effects = app.handle(open_prs("o/a", vec![by("x", 3), by("me", 8)]), t(1));
-        assert_eq!(effects, vec![Effect::SaveConfig(config(&[("o/a", &[8])]))]);
-        assert!(app.is_tracked("o/a", 8));
-        assert!(matches!(app.modal, Some(Modal::Picker(_))));
-    }
-
-    #[test]
-    fn a_background_listing_does_not_reset_the_open_picker() {
-        let mut app = detecting_app(&[("o/a", &[])]);
         open_picker_with(&mut app, &[1, 2, 3]);
         app.apply(Action::Down);
-        app.handle(open_prs("o/a", vec![by("x", 4)]), t(2));
-        let Some(Modal::Picker(picker)) = &app.modal else {
-            panic!("picker closed")
-        };
+        app.handle(open_prs(&[4], &[4]), t(2));
+        let picker = picker(&app);
         assert_eq!(picker.selected, 1);
-        assert_eq!(picker.items.as_ref().unwrap().as_ref().unwrap().len(), 3);
+        assert_eq!(numbers(picker), vec![1, 2, 3]);
     }
 
     #[test]
     fn rate_limited_listing_pauses_polling() {
-        let mut app = detecting_app(&[("o/a", &[])]);
-        app.tick(t(1));
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        app.apply(Action::AddPr);
         app.handle(
             Msg::OpenPrs {
                 repo: "o/a".into(),
@@ -1946,6 +1627,101 @@ pub(crate) mod tests {
             t(1),
         );
         assert!(app.tick(t(99)).is_empty());
+        assert_eq!(app.tick(t(100)).len(), 1);
+    }
+
+    fn open_prs(all: &[u64], mine: &[u64]) -> Msg {
+        Msg::OpenPrs {
+            repo: "o/a".into(),
+            result: Ok(OpenPrs {
+                all: summaries(all),
+                mine: summaries(mine),
+            }),
+        }
+    }
+
+    fn picker(app: &App) -> &Picker {
+        let Some(Modal::Picker(picker)) = &app.modal else {
+            panic!("picker closed")
+        };
+        picker
+    }
+
+    fn numbers(picker: &Picker) -> Vec<u64> {
+        picker.visible().iter().map(|p| p.number).collect()
+    }
+
+    #[test]
+    fn picker_opens_on_my_prs_and_m_toggles_all() {
+        let mut app = App::new(config(&[("o/a", &[])]), "cfg".into(), t(0));
+        app.apply(Action::AddPr);
+        app.handle(open_prs(&[5, 4, 3], &[4]), t(1));
+        assert!(picker(&app).mine);
+        assert_eq!(numbers(picker(&app)), vec![4]);
+        app.apply(Action::ToggleMine);
+        assert_eq!(numbers(picker(&app)), vec![5, 4, 3]);
+        app.apply(Action::Bottom);
+        assert_eq!(picker(&app).selected, 2);
+        // Toggling back resets the cursor onto the shorter list.
+        app.apply(Action::ToggleMine);
+        assert_eq!(picker(&app).selected, 0);
+        assert_eq!(
+            app.apply(Action::Enter),
+            vec![Effect::SaveConfig(config(&[("o/a", &[4])]))]
+        );
+    }
+
+    #[test]
+    fn picker_filters_by_number_prefix() {
+        let mut app = App::new(config(&[("o/a", &[])]), "cfg".into(), t(0));
+        app.apply(Action::AddPr);
+        app.handle(open_prs(&[12, 123, 21, 1], &[]), t(1));
+        app.apply(Action::ToggleMine);
+        app.apply(Action::Digit(1));
+        assert_eq!(numbers(picker(&app)), vec![12, 123, 1]);
+        app.apply(Action::Down);
+        app.apply(Action::Digit(2));
+        assert_eq!(picker(&app).filter, "12");
+        assert_eq!(numbers(picker(&app)), vec![12, 123]);
+        assert_eq!(picker(&app).selected, 0);
+        app.apply(Action::Backspace);
+        app.apply(Action::Backspace);
+        app.apply(Action::Backspace);
+        assert_eq!(picker(&app).filter, "");
+        assert_eq!(numbers(picker(&app)).len(), 4);
+        // Digits do nothing outside the picker.
+        app.apply(Action::Close);
+        assert!(app.apply(Action::Digit(1)).is_empty());
+        assert!(app.apply(Action::ToggleMine).is_empty());
+    }
+
+    #[test]
+    fn enter_tracks_the_typed_number_when_nothing_matches() {
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        app.apply(Action::AddPr);
+        // Works while the listing is still loading...
+        app.apply(Action::Digit(4));
+        app.apply(Action::Digit(2));
+        assert_eq!(
+            app.apply(Action::Enter),
+            vec![Effect::SaveConfig(config(&[("o/a", &[1, 42])]))]
+        );
+        assert_eq!(app.modal, None);
+        assert_eq!(app.repos[0].selected().unwrap().number, 42);
+
+        // ...and when the listing has no match.
+        app.apply(Action::AddPr);
+        app.handle(open_prs(&[5], &[5]), t(1));
+        app.apply(Action::Digit(7));
+        assert_eq!(
+            app.apply(Action::Enter),
+            vec![Effect::SaveConfig(config(&[("o/a", &[1, 42, 7])]))]
+        );
+        // An already tracked number leaves the picker open.
+        app.apply(Action::AddPr);
+        app.apply(Action::Digit(1));
+        assert!(app.apply(Action::Enter).is_empty());
+        assert!(matches!(app.modal, Some(Modal::Picker(_))));
     }
 
     fn summaries(numbers: &[u64]) -> Vec<PrSummary> {
@@ -1965,13 +1741,7 @@ pub(crate) mod tests {
             app.apply(Action::AddPr),
             vec![Effect::FetchOpenPrs { repo: "o/a".into() }]
         );
-        app.handle(
-            Msg::OpenPrs {
-                repo: "o/a".into(),
-                result: Ok(summaries(numbers)),
-            },
-            t(1),
-        );
+        app.handle(open_prs(numbers, numbers), t(1));
     }
 
     #[test]
@@ -2034,7 +1804,7 @@ pub(crate) mod tests {
         app.handle(
             Msg::OpenPrs {
                 repo: "o/other".into(),
-                result: Ok(summaries(&[1])),
+                result: Ok(OpenPrs::default()),
             },
             t(1),
         );
@@ -2054,6 +1824,47 @@ pub(crate) mod tests {
         };
         assert!(matches!(&picker.items, Some(Err(e)) if e.contains("down")));
         assert!(app.apply(Action::Enter).is_empty());
+    }
+
+    fn api_call(secs: i64, repo: &str) -> Msg {
+        let effect = Effect::FetchOpenPrs { repo: repo.into() };
+        let request = crate::api_log::Request::of(&effect).unwrap();
+        Msg::ApiCall(ApiCall {
+            at: t(secs),
+            request,
+            outcome: Ok(()),
+        })
+    }
+
+    #[test]
+    fn api_calls_are_logged_and_shown_in_a_scrollable_window() {
+        let mut app = App::new(config(&[("o/a", &[])]), "cfg".into(), t(0));
+        app.log_height = 10;
+        for i in 0..30 {
+            assert!(app.handle(api_call(i, "o/a"), t(i)).is_empty());
+        }
+        assert_eq!(app.api_log.len(), 30);
+
+        app.apply(Action::ApiLog);
+        let scroll = |app: &App| match &app.modal {
+            Some(Modal::ApiLog(scroll)) => scroll.top(app.api_log.len(), 10),
+            other => panic!("not the API log: {other:?}"),
+        };
+        // Opens at the end, following new calls.
+        assert_eq!(scroll(&app), 20);
+        app.handle(api_call(30, "o/a"), t(30));
+        assert_eq!(scroll(&app), 21);
+        app.apply(Action::PageUp);
+        assert_eq!(scroll(&app), 11);
+        app.apply(Action::Top);
+        assert_eq!(scroll(&app), 0);
+        app.apply(Action::Down);
+        assert_eq!(scroll(&app), 1);
+        // Other keys are swallowed while it is open.
+        assert!(app.apply(Action::AddPr).is_empty());
+        assert!(matches!(app.modal, Some(Modal::ApiLog(_))));
+        app.apply(Action::Close);
+        assert_eq!(app.modal, None);
     }
 
     #[test]

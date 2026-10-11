@@ -2,6 +2,9 @@
 
 Status: Implemented
 
+> The new-PR detection and closed-PR removal below are replaced by
+> [0008-manual-tracking.md](0008-manual-tracking.md).
+
 Extends [0002-pr-tracking.md](0002-pr-tracking.md),
 [0003-pr-autodetect.md](0003-pr-autodetect.md) and
 [0005-auto-untrack-closed.md](0005-auto-untrack-closed.md). New PRs are only

@@ -2,6 +2,9 @@
 
 Status: Implemented
 
+> The polling rules below are replaced by
+> [0008-manual-tracking.md](0008-manual-tracking.md).
+
 Extends [0002-pr-tracking.md](0002-pr-tracking.md). Waiting for CI means
 either staring at the TUI or forgetting to come back to it; ghui should tell
 the user when a watched PR's checks are done.
@@ -34,11 +37,13 @@ repo tab is not active.
 
 ### Delivery
 
-- Native OS notification: Notification Center on macOS, the D-Bus
-  notification service on Linux.
+- Native OS notification: Notification Center on macOS, posted with
+  `osascript` (`display notification`), so it is attributed to Script
+  Editor; the D-Bus notification service on Linux.
 - Sending never blocks the UI. If the system refuses the notification (e.g.
-  no notification service on Linux) the error is shown in the status bar.
-  macOS does not report delivery failures.
+  no notification service on Linux, or `osascript` fails) the error is
+  shown in the status bar. macOS does not report notifications muted in
+  System Settings.
 
 ### Polling every tracked repo
 

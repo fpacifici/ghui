@@ -45,8 +45,9 @@ with a message telling the user to set `GH_TOKEN` or run `gh auth login`.
    error in the body. Network errors are retried on the next poll.
 2. **PR list** (left, narrow) — one row per tracked PR:
    `● #123 Title…`. The dot is the aggregate check state (green success, red
-   failure, yellow pending, gray none). Merged/closed PRs are untracked
-   automatically (see [0005-auto-untrack-closed.md](0005-auto-untrack-closed.md)).
+   failure, yellow pending, gray none). Merged/closed PRs stay until
+   untracked and are tagged `merged` / `closed` (see
+   [0008-manual-tracking.md](0008-manual-tracking.md)).
 3. **Detail** (right):
    - Top third: a header line with author, `head → base`, state and the PR
      URL, followed by the raw markdown description, truncated to fit.
@@ -66,23 +67,18 @@ statuses.
 
 ### Polling
 
-- Opening a repo tab fetches every tracked PR in it (one GraphQL request).
-- While a tab is active its tracked PRs are re-fetched in that same single
-  request: every 5 s while the **selected** PR has pending checks (or has
-  not loaded yet), every 60 s once all its checks have completed. Inactive
-  tabs are polled in the background only as described in
-  [0004-check-notifications.md](0004-check-notifications.md).
-- A repo that failed to load is retried every 60 s.
-- `r` refreshes every tab immediately and looks for new PRs
-  ([0006-refresh-all.md](0006-refresh-all.md)); in the log window it
-  refreshes the log.
-- When rate limited, polling pauses until the reset time and the status bar
-  says so.
+Replaced by [0008-manual-tracking.md](0008-manual-tracking.md): every tab
+is fetched at start-up, then only PRs with pending checks are polled,
+every 30 s, in every tab. `r` refreshes every tab (in the log window it
+refreshes the log). When rate limited, polling pauses until the reset time
+and the status bar says so.
 
 ### Add-PR picker (`Ctrl+A`)
 
-A modal listing the 50 most recently updated open PRs of the current repo.
-Already tracked PRs are marked `✓`. `Enter` on an untracked PR adds it to the
+A modal listing open PRs of the current repo: the user's, or the 50 most
+recently updated, filterable by number; see
+[0008-manual-tracking.md](0008-manual-tracking.md). Already tracked PRs are
+marked `✓`. `Enter` on an untracked PR adds it to the
 config, closes the picker and selects the new PR; `Enter` on a tracked PR
 does nothing.
 
@@ -140,7 +136,8 @@ completed checks and for running checks without a URL.
 - [x] One tab per repo; inaccessible repos are dimmed and show their error.
 - [x] PR list shows aggregate status, number and title.
 - [x] Detail shows header with URL, raw description (top third) and checks.
-- [x] The selected PR's checks refresh every 5 s while pending, 60 s after.
+- [x] The selected PR's checks refresh every 5 s while pending, 60 s after
+      (now every 30 s while pending only; see 0008).
 - [x] Picker lists 50 open PRs, marks tracked ones and adds on Enter.
 - [x] `Ctrl+D` (or `d`) untracks the selected PR and persists the change;
       it is a no-op while a modal is open.
@@ -153,7 +150,7 @@ completed checks and for running checks without a URL.
 ## Out of scope
 
 - Adding or removing repos from the UI.
-- Filtering/searching the picker; more than 50 PRs.
+- Searching the picker by title; more than 50 PRs (number filter: 0008).
 - Rendering markdown; scrolling the description.
 - Re-running checks, commenting, reviewing or merging.
 - Mouse support.

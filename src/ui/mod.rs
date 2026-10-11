@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::app::{App, Focus, Modal};
 
+mod api_log;
 mod checks;
 mod detail;
 pub mod log_view;
@@ -36,6 +37,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     match &app.modal {
         Some(Modal::Picker(p)) => picker::render(app, p, frame, body_area),
         Some(Modal::Log(view)) => log_view::render(view, app.now, frame, frame.area()),
+        Some(Modal::ApiLog(scroll)) => api_log::render(&app.api_log, scroll, frame, frame.area()),
         None => {}
     }
 }
@@ -93,15 +95,18 @@ fn render_empty_config(app: &App, frame: &mut Frame, area: Rect) {
 
 fn footer(app: &App) -> Line<'static> {
     let keys = match (&app.modal, app.focus) {
-        (Some(Modal::Picker(_)), _) => " esc close · j/k move · pgup/pgdn page · enter add",
+        (Some(Modal::Picker(_)), _) => {
+            " esc close · j/k move · pgup/pgdn page · m mine/all · 0-9 filter · enter add"
+        }
+        (Some(Modal::ApiLog(_)), _) => " esc close · j/k scroll · pgup/pgdn page · g/G top/bottom",
         (Some(Modal::Log(_)), _) => {
             " esc close · j/k scroll · pgup/pgdn page · g/G top/bottom · r refresh · y copy url · o open"
         }
         (None, Focus::List) => {
-            " q quit · </> repo · → checks · j/k move · enter/o open · ^A add · ^D untrack · r refresh · y copy url"
+            " q quit · </> repo · → checks · j/k move · enter/o open · ^A add · ^D untrack · r refresh · y copy url · L api log"
         }
         (None, Focus::Checks) => {
-            " q quit · </> repo · ←/→/space fold · j/k move · enter logs/open running · r refresh · y copy url · o open check"
+            " q quit · </> repo · ←/→/space fold · j/k move · enter logs/open running · r refresh · y copy url · o open check · L api log"
         }
     };
     Line::from(keys).dark_gray()
@@ -412,18 +417,44 @@ pub(crate) mod tests {
         app.handle(
             Msg::OpenPrs {
                 repo: "o/a".into(),
-                result: Ok(vec![
-                    summary(1, "tracked", false),
-                    summary(7, "new one", true),
-                ]),
+                result: Ok(crate::github::OpenPrs {
+                    all: vec![summary(1, "tracked", false), summary(7, "new one", true)],
+                    mine: vec![summary(7, "new one", true)],
+                }),
             },
             t(0),
         );
         let out = text(&draw(&app, 120, 30));
-        assert!(out.contains("Add a PR to o/a"));
+        assert!(out.contains("Add a PR to o/a — mine (m: all)"), "{out}");
+        assert!(!out.contains("tracked  bob"), "{out}");
+        assert!(out.contains("#7 new one  bob [draft]"));
+        assert!(out.contains("type a PR number to filter"), "{out}");
+        assert!(out.contains("enter add"));
+
+        app.apply(Action::ToggleMine);
+        let out = text(&draw(&app, 120, 30));
+        assert!(out.contains("Add a PR to o/a — all (m: mine)"), "{out}");
         assert!(out.contains("✓ #1 tracked  bob"));
         assert!(out.contains("#7 new one  bob [draft]"));
-        assert!(out.contains("enter add"));
+
+        app.apply(Action::Digit(4));
+        let out = text(&draw(&app, 120, 30));
+        assert!(out.contains("#4▏"), "{out}");
+        assert!(out.contains("No PR matches #4."), "{out}");
+        assert!(out.contains("Enter: track #4"), "{out}");
+    }
+
+    #[test]
+    fn closed_prs_are_tagged_in_the_list() {
+        let mut app = sample_app();
+        let merged = crate::github::PrDetail {
+            state: crate::github::PrState::Merged,
+            ..detail(2, vec![])
+        };
+        app.handle(loaded("o/a", vec![(2, Ok(merged))]), t(20));
+        let out = text(&draw(&app, 120, 30));
+        assert!(out.contains("#2 PR 2 merged"), "{out}");
+        assert!(!out.contains("#1 PR 1 merged"), "{out}");
     }
 
     fn open_log(app: &mut App, check_index: usize) {
@@ -503,6 +534,67 @@ pub(crate) mod tests {
         let out = text(&draw(&app, 100, 20));
         assert!(out.contains("Deployed to preview"));
         assert!(out.contains("Details: https://ci/deploy"));
+    }
+
+    #[test]
+    fn api_log_lists_calls_with_their_outcome() {
+        use crate::api_log::{ApiCall, Request};
+        use crate::app::Effect;
+        let mut app = sample_app();
+        app.apply(Action::ApiLog);
+        let out = text(&draw(&app, 120, 20));
+        assert!(out.contains("API calls (0)"), "{out}");
+        assert!(out.contains("No API calls yet."), "{out}");
+
+        let fetch = Effect::FetchPrs {
+            repo: "o/a".into(),
+            numbers: vec![1, 2],
+            steps: Some(1),
+        };
+        let log = Effect::FetchLog {
+            repo: "o/a".into(),
+            job_id: 7,
+        };
+        for (secs, effect, outcome) in [
+            (0, fetch, Ok(())),
+            (65, log, Err("rate limited".to_string())),
+        ] {
+            app.handle(
+                Msg::ApiCall(ApiCall {
+                    at: t(secs),
+                    request: Request::of(&effect).unwrap(),
+                    outcome,
+                }),
+                t(secs),
+            );
+        }
+        let buffer = draw(&app, 120, 20);
+        let out = text(&buffer);
+        assert!(out.contains("API calls (2) · UTC"), "{out}");
+        let line = |needle: &str| {
+            out.lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle}: {out}"))
+                .to_string()
+        };
+        let first = line("PRs o/a #1 #2 (steps #1)");
+        assert!(first.contains("POST /graphql"), "{out}");
+        assert!(
+            first
+                .trim_end()
+                .trim_end_matches('│')
+                .trim_end()
+                .ends_with("ok"),
+            "{out}"
+        );
+        assert!(
+            line("job log").contains("GET  /repos/o/a/actions/jobs/7/logs"),
+            "{out}"
+        );
+        let (x, y) = find(&buffer, "rate limited").unwrap();
+        assert_eq!(buffer[(x, y)].fg, Color::Red);
+        assert!(out.contains("1–2 / 2"), "{out}");
+        assert!(out.contains("g/G top/bottom"), "{out}");
     }
 
     #[test]

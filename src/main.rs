@@ -1,5 +1,6 @@
 //! ghui — a terminal UI that tracks GitHub PRs and their checks.
 
+mod api_log;
 mod app;
 mod auth;
 mod check_tree;
@@ -8,6 +9,8 @@ mod event;
 mod github;
 mod log_view;
 mod logs;
+mod notify;
+mod scroll;
 mod ui;
 mod worker;
 
@@ -108,32 +111,20 @@ fn execute<G: GitHub>(app: &mut App, worker: &Worker<G>, effects: Vec<Effect>, l
                 // block the UI on it.
                 let results = local.results.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = notify(&title, &body) {
+                    if let Err(e) = notify::send(&title, &body) {
                         let _ = results.send(Msg::NotifyFailed(format!("cannot notify: {e}")));
                     }
                 });
                 Ok(())
             }
-            Effect::FetchPrs { .. }
-            | Effect::FetchOpenPrs { .. }
-            | Effect::FetchViewer
-            | Effect::FetchLog { .. } => unreachable!("network effects are spawned"),
+            Effect::FetchPrs { .. } | Effect::FetchOpenPrs { .. } | Effect::FetchLog { .. } => {
+                unreachable!("network effects are spawned")
+            }
         };
         if let Err(message) = result {
             app.report_error(message);
         }
     }
-}
-
-/// Shows a native desktop notification.
-fn notify(title: &str, body: &str) -> Result<(), notify_rust::error::Error> {
-    // On macOS the notification is sent when the returned handle drops.
-    notify_rust::Notification::new()
-        .appname("ghui")
-        .summary(title)
-        .body(body)
-        .show()
-        .map(drop)
 }
 
 /// Copies through the terminal with an OSC 52 escape sequence, which also

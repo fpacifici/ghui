@@ -59,14 +59,24 @@ pub fn prs(numbers: &[u64], steps: Option<u64>) -> String {
     )
 }
 
-/// The 50 most recently updated open PRs of `$owner/$name`.
-pub const OPEN_PRS: &str = "query($owner: String!, $name: String!) {
+/// The 50 most recently updated open PRs of `$owner/$name`, and the
+/// first 50 results of the search `$mine` (see [`mine_search`]).
+pub const OPEN_PRS: &str = "query($owner: String!, $name: String!, $mine: String!) {
   repository(owner: $owner, name: $name) {
     pullRequests(states: OPEN, first: 50, orderBy: { field: UPDATED_AT, direction: DESC }) {
-      nodes { number title isDraft updatedAt author { login } }
+      nodes { ...Summary }
     }
   }
-}";
+  mine: search(query: $mine, type: ISSUE, first: 50) {
+    nodes { ...Summary }
+  }
+}
+fragment Summary on PullRequest { number title isDraft updatedAt author { login } }";
+
+/// Search for the authenticated user's open PRs in `repo`.
+pub fn mine_search(repo: &str) -> String {
+    format!("repo:{repo} is:pr is:open author:@me sort:updated-desc")
+}
 
 #[cfg(test)]
 mod tests {

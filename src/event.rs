@@ -34,6 +34,14 @@ pub enum Action {
     Refresh,
     CopyUrl,
     OpenUrl,
+    /// `m`: in the picker, switch between the user's PRs and all.
+    ToggleMine,
+    /// `0`–`9`: in the picker, type into the PR number filter.
+    Digit(u8),
+    /// `Backspace`: in the picker, delete the last filter digit.
+    Backspace,
+    /// `L`: open the API call log.
+    ApiLog,
 }
 
 /// Waits briefly for an input event and maps it to an [`Action`].
@@ -78,6 +86,10 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('r') => Action::Refresh,
         KeyCode::Char('y') => Action::CopyUrl,
         KeyCode::Char('o') => Action::OpenUrl,
+        KeyCode::Char('m') => Action::ToggleMine,
+        KeyCode::Char(c @ '0'..='9') => Action::Digit(c as u8 - b'0'),
+        KeyCode::Backspace => Action::Backspace,
+        KeyCode::Char('L') => Action::ApiLog,
         _ => return None,
     };
     Some(action)
@@ -121,6 +133,21 @@ mod tests {
         assert_eq!(map_key(ctrl('d')), Some(Action::Untrack));
         assert_eq!(map_key(key(KeyCode::Char('d'))), Some(Action::Untrack));
         assert_eq!(map_key(ctrl('x')), None);
+    }
+
+    #[test]
+    fn picker_keys() {
+        assert_eq!(map_key(key(KeyCode::Char('m'))), Some(Action::ToggleMine));
+        assert_eq!(map_key(key(KeyCode::Char('0'))), Some(Action::Digit(0)));
+        assert_eq!(map_key(key(KeyCode::Char('7'))), Some(Action::Digit(7)));
+        assert_eq!(map_key(key(KeyCode::Backspace)), Some(Action::Backspace));
+    }
+
+    #[test]
+    fn capital_l_opens_the_api_log() {
+        let shifted = KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT);
+        assert_eq!(map_key(shifted), Some(Action::ApiLog));
+        assert_eq!(map_key(key(KeyCode::Char('l'))), Some(Action::FocusRight));
     }
 
     #[test]
