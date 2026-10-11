@@ -29,9 +29,13 @@ impl<G: GitHub> Worker<G> {
         let github = Arc::clone(&self.github);
         let results = self.results.clone();
         match effect {
-            Effect::FetchPrs { repo, numbers } => {
+            Effect::FetchPrs {
+                repo,
+                numbers,
+                steps,
+            } => {
                 self.runtime.spawn(async move {
-                    let result = github.fetch_prs(&repo, &numbers).await;
+                    let result = github.fetch_prs(&repo, &numbers, steps).await;
                     // The receiver is gone only when the app is quitting.
                     let _ = results.send(Msg::Prs { repo, result });
                 });
@@ -79,7 +83,12 @@ pub(crate) mod tests {
     pub struct FakeGitHub;
 
     impl GitHub for FakeGitHub {
-        async fn fetch_prs(&self, repo: &str, numbers: &[u64]) -> Result<Vec<PrResult>, ApiError> {
+        async fn fetch_prs(
+            &self,
+            repo: &str,
+            numbers: &[u64],
+            _steps: Option<u64>,
+        ) -> Result<Vec<PrResult>, ApiError> {
             if repo == "o/missing" {
                 return Err(ApiError::NotFound(repo.into()));
             }
@@ -111,6 +120,7 @@ pub(crate) mod tests {
         let left = worker.spawn(Effect::FetchPrs {
             repo: "o/a".into(),
             numbers: vec![1],
+            steps: Some(1),
         });
         assert_eq!(left, None);
         let msg = rx.recv_timeout(Duration::from_secs(5)).unwrap();

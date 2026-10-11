@@ -1,0 +1,335 @@
+{
+  "data": {
+    "repository": {
+      "nameWithOwner": "fpacifici/ghui",
+      "pr_5": {
+        "number": 5,
+        "title": "Open the PR, or a running check, in the browser on Enter (spec 0005)",
+        "body": "## Summary\n\nShortened for the fixture.",
+        "url": "https://github.com/fpacifici/ghui/pull/5",
+        "state": "MERGED",
+        "author": {
+          "login": "fpacifici"
+        },
+        "headRefName": "enter_opens_browser",
+        "baseRefName": "main",
+        "commits": {
+          "nodes": [
+            {
+              "commit": {
+                "statusCheckRollup": {
+                  "contexts": {
+                    "nodes": [
+                      {
+                        "__typename": "CheckRun",
+                        "databaseId": 114402659009,
+                        "name": "fmt / clippy / test (ubuntu-latest)",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                        "startedAt": "2026-10-11T06:00:17Z",
+                        "completedAt": "2026-10-11T06:01:10Z",
+                        "detailsUrl": "https://github.com/fpacifici/ghui/actions/runs/38116619458/job/114402659009",
+                        "title": null,
+                        "summary": null,
+                        "checkSuite": {
+                          "app": {
+                            "slug": "github-actions"
+                          },
+                          "workflowRun": {
+                            "databaseId": 38116619458,
+                            "workflow": {
+                              "name": "CI"
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "databaseId": 114402658850,
+                        "name": "fmt / clippy / test (macos-latest)",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                        "startedAt": "2026-10-11T06:00:23Z",
+                        "completedAt": "2026-10-11T06:01:25Z",
+                        "detailsUrl": "https://github.com/fpacifici/ghui/actions/runs/38116619458/job/114402658850",
+                        "title": null,
+                        "summary": null,
+                        "checkSuite": {
+                          "app": {
+                            "slug": "github-actions"
+                          },
+                          "workflowRun": {
+                            "databaseId": 38116619458,
+                            "workflow": {
+                              "name": "CI"
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "pr_6": {
+        "number": 6,
+        "title": "Untrack merged and closed PRs automatically (spec 0005)",
+        "body": "## Summary\n\nShortened for the fixture.",
+        "url": "https://github.com/fpacifici/ghui/pull/6",
+        "state": "MERGED",
+        "author": {
+          "login": "fpacifici"
+        },
+        "headRefName": "pr_autoclose",
+        "baseRefName": "main",
+        "commits": {
+          "nodes": [
+            {
+              "commit": {
+                "statusCheckRollup": {
+                  "contexts": {
+                    "nodes": [
+                      {
+                        "__typename": "CheckRun",
+                        "databaseId": 114403509326,
+                        "name": "fmt / clippy / test (ubuntu-latest)",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                        "startedAt": "2026-10-11T06:05:24Z",
+                        "completedAt": "2026-10-11T06:06:10Z",
+                        "detailsUrl": "https://github.com/fpacifici/ghui/actions/runs/38116915011/job/114403509326",
+                        "title": null,
+                        "summary": null,
+                        "checkSuite": {
+                          "app": {
+                            "slug": "github-actions"
+                          },
+                          "workflowRun": {
+                            "databaseId": 38116915011,
+                            "workflow": {
+                              "name": "CI"
+                            }
+                          }
+                        },
+                        "steps": {
+                          "nodes": [
+                            {
+                              "number": 1,
+                              "name": "Set up job",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:05:24Z",
+                              "completedAt": "2026-10-11T06:05:25Z"
+                            },
+                            {
+                              "number": 2,
+                              "name": "Run actions/checkout@v4",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:05:25Z",
+                              "completedAt": "2026-10-11T06:05:26Z"
+                            },
+                            {
+                              "number": 3,
+                              "name": "Install Rust toolchain",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:05:26Z",
+                              "completedAt": "2026-10-11T06:05:26Z"
+                            },
+                            {
+                              "number": 4,
+                              "name": "Run Swatinem/rust-cache@v2",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:05:26Z",
+                              "completedAt": "2026-10-11T06:05:54Z"
+                            },
+                            {
+                              "number": 5,
+                              "name": "Check formatting",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:05:54Z",
+                              "completedAt": "2026-10-11T06:05:55Z"
+                            },
+                            {
+                              "number": 6,
+                              "name": "Clippy",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:05:55Z",
+                              "completedAt": "2026-10-11T06:05:59Z"
+                            },
+                            {
+                              "number": 7,
+                              "name": "Test",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:05:59Z",
+                              "completedAt": "2026-10-11T06:06:02Z"
+                            },
+                            {
+                              "number": 8,
+                              "name": "Release build",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:06:02Z",
+                              "completedAt": "2026-10-11T06:06:08Z"
+                            },
+                            {
+                              "number": 15,
+                              "name": "Post Run Swatinem/rust-cache@v2",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:06:08Z",
+                              "completedAt": "2026-10-11T06:06:08Z"
+                            },
+                            {
+                              "number": 16,
+                              "name": "Post Run actions/checkout@v4",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:06:08Z",
+                              "completedAt": "2026-10-11T06:06:08Z"
+                            },
+                            {
+                              "number": 17,
+                              "name": "Complete job",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:06:08Z",
+                              "completedAt": "2026-10-11T06:06:08Z"
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "databaseId": 114403509246,
+                        "name": "fmt / clippy / test (macos-latest)",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                        "startedAt": "2026-10-11T06:05:28Z",
+                        "completedAt": "2026-10-11T06:06:23Z",
+                        "detailsUrl": "https://github.com/fpacifici/ghui/actions/runs/38116915011/job/114403509246",
+                        "title": null,
+                        "summary": null,
+                        "checkSuite": {
+                          "app": {
+                            "slug": "github-actions"
+                          },
+                          "workflowRun": {
+                            "databaseId": 38116915011,
+                            "workflow": {
+                              "name": "CI"
+                            }
+                          }
+                        },
+                        "steps": {
+                          "nodes": [
+                            {
+                              "number": 1,
+                              "name": "Set up job",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:05:29Z",
+                              "completedAt": "2026-10-11T06:05:30Z"
+                            },
+                            {
+                              "number": 2,
+                              "name": "Run actions/checkout@v4",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:05:30Z",
+                              "completedAt": "2026-10-11T06:05:32Z"
+                            },
+                            {
+                              "number": 3,
+                              "name": "Install Rust toolchain",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:05:32Z",
+                              "completedAt": "2026-10-11T06:05:32Z"
+                            },
+                            {
+                              "number": 4,
+                              "name": "Run Swatinem/rust-cache@v2",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:05:32Z",
+                              "completedAt": "2026-10-11T06:05:57Z"
+                            },
+                            {
+                              "number": 5,
+                              "name": "Check formatting",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:05:57Z",
+                              "completedAt": "2026-10-11T06:05:59Z"
+                            },
+                            {
+                              "number": 6,
+                              "name": "Clippy",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:05:59Z",
+                              "completedAt": "2026-10-11T06:06:04Z"
+                            },
+                            {
+                              "number": 7,
+                              "name": "Test",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:06:04Z",
+                              "completedAt": "2026-10-11T06:06:10Z"
+                            },
+                            {
+                              "number": 8,
+                              "name": "Release build",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:06:10Z",
+                              "completedAt": "2026-10-11T06:06:18Z"
+                            },
+                            {
+                              "number": 15,
+                              "name": "Post Run Swatinem/rust-cache@v2",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:06:18Z",
+                              "completedAt": "2026-10-11T06:06:19Z"
+                            },
+                            {
+                              "number": 16,
+                              "name": "Post Run actions/checkout@v4",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:06:19Z",
+                              "completedAt": "2026-10-11T06:06:19Z"
+                            },
+                            {
+                              "number": 17,
+                              "name": "Complete job",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "startedAt": "2026-10-11T06:06:19Z",
+                              "completedAt": "2026-10-11T06:06:20Z"
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

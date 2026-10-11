@@ -68,8 +68,7 @@ fn render_body(app: &App, frame: &mut Frame, area: Rect) {
     let pr = repo.selected();
     detail::render(pr, frame, detail_area);
     checks::render(
-        pr.and_then(|p| p.detail.as_ref()),
-        repo.selected_check,
+        repo,
         app.focus == Focus::Checks,
         app.now,
         frame,
@@ -102,7 +101,7 @@ fn footer(app: &App) -> Line<'static> {
             " q quit · </> repo · → checks · j/k move · enter/o open · ^A add · ^D untrack · r refresh · y copy url"
         }
         (None, Focus::Checks) => {
-            " q quit · </> repo · ← PRs · j/k move · enter logs/open running · r refresh · y copy url · o open check"
+            " q quit · </> repo · ←/→/space fold · j/k move · enter logs/open running · r refresh · y copy url · o open check"
         }
     };
     Line::from(keys).dark_gray()
@@ -211,11 +210,69 @@ pub(crate) mod tests {
         assert!(out.contains("https://github.com/o/r/pull/1"));
         assert!(out.contains("## Summary"));
         assert!(out.contains("1 failing, 1 pending, 1 successful, 0 skipped"));
-        assert!(out.contains("X  lint"));
-        assert!(out.contains("*  build"));
+        assert!(out.contains("  X lint"));
+        assert!(out.contains("  * build"));
         assert!(out.contains("50s"), "running check elapsed: {out}");
         assert!(out.contains("20s"), "completed check elapsed: {out}");
         assert!(out.contains("q quit"));
+    }
+
+    #[test]
+    fn checks_render_as_a_tree_of_runs_jobs_and_steps() {
+        use crate::github::Step;
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        let step = |number, name: &str, state, started: Option<i64>| Step {
+            number,
+            name: name.into(),
+            state,
+            started_at: started.map(t),
+            completed_at: (state != CheckState::Pending).then(|| t(5)),
+        };
+        let mut test = check("test", CheckState::Pending);
+        test.run_id = Some(7);
+        test.steps = vec![
+            step(1, "Set up job", CheckState::Pass, Some(0)),
+            step(2, "Run tests", CheckState::Pending, Some(5)),
+            step(3, "Post checkout", CheckState::Pending, None),
+        ];
+        let mut lint = check("lint", CheckState::Fail);
+        lint.run_id = Some(7);
+        lint.steps = vec![step(1, "Clippy", CheckState::Fail, Some(0))];
+        let mut status = check("deploy", CheckState::Pass);
+        status.workflow = None;
+        status.kind = crate::github::CheckKind::Status { description: None };
+        app.handle(
+            loaded("o/a", vec![(1, Ok(detail(1, vec![lint, test, status])))]),
+            t(0),
+        );
+        app.now = t(20);
+        let out = text(&draw(&app, 120, 30));
+        let line = |needle: &str| {
+            out.lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle}: {out}"))
+                .to_string()
+        };
+        assert!(line("▾ X CI").contains("2 jobs"), "{out}");
+        assert!(line("▾ X CI").contains("50s"), "{out}");
+        assert!(line("  ▸ X lint").contains("20s"), "{out}");
+        assert!(!out.contains("Clippy"), "{out}");
+        assert!(line("  ▾ * test").contains("50s"), "{out}");
+        assert!(line("      ✓ Set up job").contains("5s"), "{out}");
+        assert!(line("      * Run tests").contains("15s"), "{out}");
+        // Not started: no time.
+        let post = line("      * Post checkout");
+        assert!(!post.chars().any(|c| c.is_ascii_digit()), "{out}");
+        assert!(line("  ✓ deploy").contains("20s"), "{out}");
+        assert!(out.contains("1 failing, 1 pending, 1 successful"), "{out}");
+
+        // Expanding the failed job shows the failing step.
+        app.apply(Action::FocusRight);
+        app.apply(Action::Down);
+        app.apply(Action::Toggle);
+        let out = text(&draw(&app, 120, 30));
+        assert!(out.contains("  ▾ X lint"), "{out}");
+        assert!(out.contains("      X Clippy"), "{out}");
     }
 
     #[test]

@@ -41,6 +41,7 @@ make check     # fmt-check + clippy + tests — run before every commit
 │   ├── config.rs             # ~/.ghui/config.yaml load/save
 │   ├── event.rs              # Action enum, terminal input → Action mapping
 │   ├── app.rs                # App state; pure apply/handle/tick → Effects
+│   ├── check_tree.rs         # checks pane rows: runs → jobs → steps
 │   ├── log_view.rs           # log window state (scroll, follow, polling)
 │   ├── logs.rs               # cleaning of raw Actions logs
 │   ├── worker.rs             # network Effects → tokio tasks → Msg channel

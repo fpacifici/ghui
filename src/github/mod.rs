@@ -12,13 +12,15 @@ pub mod query;
 
 /// The subset of the GitHub API ghui needs.
 pub trait GitHub: Send + Sync + 'static {
-    /// Fetches the given PRs of `repo` (`owner/name`) in one request. The
+    /// Fetches the given PRs of `repo` (`owner/name`) in one request, with
+    /// the job steps of PR `steps` only, since steps are expensive. The
     /// outer error is repo-wide (not found, no access, network); the inner
     /// one is per PR.
     fn fetch_prs(
         &self,
         repo: &str,
         numbers: &[u64],
+        steps: Option<u64>,
     ) -> impl Future<Output = Result<Vec<PrResult>, ApiError>> + Send;
 
     /// The 50 most recently updated open PRs of `repo`.
@@ -124,12 +126,43 @@ pub struct Check {
     pub completed_at: Option<DateTime<Utc>>,
     pub url: Option<String>,
     pub kind: CheckKind,
+    /// The Actions workflow run of a job; jobs are grouped by it.
+    pub run_id: Option<u64>,
+    /// An Actions job's steps in execution order; empty for other checks
+    /// and when steps were not requested.
+    pub steps: Vec<Step>,
 }
 
 impl Check {
     pub fn is_running(&self) -> bool {
         self.state == CheckState::Pending
     }
+
+    pub fn job_id(&self) -> Option<u64> {
+        match self.kind {
+            CheckKind::ActionsJob { job_id } => Some(job_id),
+            _ => None,
+        }
+    }
+
+    /// The job's page scrolled to step `number`, for Actions jobs.
+    pub fn step_url(&self, number: u64) -> Option<String> {
+        let url = self.url.as_ref()?;
+        Some(match self.kind {
+            CheckKind::ActionsJob { .. } => format!("{url}#step:{number}:1"),
+            _ => url.clone(),
+        })
+    }
+}
+
+/// A step of an Actions job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    pub number: u64,
+    pub name: String,
+    pub state: CheckState,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

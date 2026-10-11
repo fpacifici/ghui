@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::query::pr_alias;
-use super::{ApiError, Check, CheckKind, CheckState, PrDetail, PrResult, PrState, PrSummary};
+use super::{ApiError, Check, CheckKind, CheckState, PrDetail, PrResult, PrState, PrSummary, Step};
 
 /// Parses the response to [`super::query::prs`].
 pub fn prs(response: &Value, numbers: &[u64]) -> Result<Vec<PrResult>, ApiError> {
@@ -172,6 +172,9 @@ enum RawContext {
         title: Option<String>,
         summary: Option<String>,
         check_suite: Option<RawCheckSuite>,
+        /// Only present when steps were requested.
+        #[serde(default)]
+        steps: Option<RawSteps>,
     },
     #[serde(rename_all = "camelCase")]
     StatusContext {
@@ -196,8 +199,26 @@ struct RawApp {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawWorkflowRun {
+    database_id: Option<u64>,
     workflow: RawWorkflow,
+}
+
+#[derive(Deserialize)]
+struct RawSteps {
+    nodes: Vec<RawStep>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawStep {
+    number: u64,
+    name: String,
+    status: String,
+    conclusion: Option<String>,
+    started_at: Option<DateTime<Utc>>,
+    completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Deserialize)]
@@ -246,15 +267,26 @@ fn check(raw: RawContext) -> Check {
             title,
             summary,
             check_suite,
+            steps,
         } => {
-            let (slug, workflow) = check_suite
-                .map(|s| {
-                    (
-                        s.app.map(|a| a.slug),
-                        s.workflow_run.map(|w| w.workflow.name),
-                    )
-                })
+            let (slug, run) = check_suite
+                .map(|s| (s.app.map(|a| a.slug), s.workflow_run))
                 .unwrap_or_default();
+            let run_id = run.as_ref().and_then(|r| r.database_id);
+            let workflow = run.map(|r| r.workflow.name);
+            let mut steps: Vec<Step> = steps
+                .map(|s| s.nodes)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| Step {
+                    number: s.number,
+                    name: s.name,
+                    state: check_run_state(&s.status, s.conclusion.as_deref()),
+                    started_at: s.started_at,
+                    completed_at: s.completed_at,
+                })
+                .collect();
+            steps.sort_by_key(|s| s.number);
             let kind = match (slug.as_deref(), database_id) {
                 (Some("github-actions"), Some(job_id)) => CheckKind::ActionsJob { job_id },
                 _ => CheckKind::CheckRun { title, summary },
@@ -267,6 +299,8 @@ fn check(raw: RawContext) -> Check {
                 completed_at,
                 url: details_url,
                 kind,
+                run_id,
+                steps,
             }
         }
         RawContext::StatusContext {
@@ -285,6 +319,8 @@ fn check(raw: RawContext) -> Check {
                 completed_at: None,
                 url: target_url,
                 kind: CheckKind::Status { description },
+                run_id: None,
+                steps: Vec::new(),
             }
         }
     }
@@ -348,6 +384,27 @@ mod tests {
 
         assert_eq!(prs[1].0, 99999);
         assert_eq!(prs[1].1.as_ref().unwrap_err(), "not found");
+    }
+
+    #[test]
+    fn parses_workflow_runs_and_steps_when_requested() {
+        let prs = prs(&fixture("prs_steps.json"), &[5, 6]).unwrap();
+        let without = prs[0].1.as_ref().unwrap();
+        assert!(without.checks.iter().all(|c| c.steps.is_empty()));
+        assert_eq!(without.checks[0].run_id, Some(38116619458));
+
+        let with = prs[1].1.as_ref().unwrap();
+        assert_eq!(with.checks.len(), 2);
+        let job = &with.checks[0];
+        assert_eq!(job.name, "fmt / clippy / test (macos-latest)");
+        assert_eq!(job.run_id, Some(38116915011));
+        assert_eq!(job.steps.len(), 11);
+        let first = &job.steps[0];
+        assert_eq!((first.number, first.name.as_str()), (1, "Set up job"));
+        assert_eq!(first.state, CheckState::Pass);
+        assert!(first.started_at.is_some() && first.completed_at.is_some());
+        let numbers: Vec<u64> = job.steps.iter().map(|s| s.number).collect();
+        assert!(numbers.is_sorted(), "{numbers:?}");
     }
 
     #[test]

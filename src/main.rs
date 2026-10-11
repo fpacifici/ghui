@@ -2,6 +2,7 @@
 
 mod app;
 mod auth;
+mod check_tree;
 mod config;
 mod event;
 mod github;

@@ -26,6 +26,8 @@ pub enum Action {
     Top,
     Bottom,
     Enter,
+    /// `Space`: expand or collapse in the checks tree.
+    Toggle,
     AddPr,
     /// `Ctrl+D` or `d`: stop tracking the selected PR.
     Untrack,
@@ -71,6 +73,7 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Home | KeyCode::Char('g') => Action::Top,
         KeyCode::End | KeyCode::Char('G') => Action::Bottom,
         KeyCode::Enter => Action::Enter,
+        KeyCode::Char(' ') => Action::Toggle,
         KeyCode::Char('d') => Action::Untrack,
         KeyCode::Char('r') => Action::Refresh,
         KeyCode::Char('y') => Action::CopyUrl,
@@ -98,6 +101,7 @@ mod tests {
         assert_eq!(map_key(key(KeyCode::Char('l'))), Some(Action::FocusRight));
         assert_eq!(map_key(key(KeyCode::Char('j'))), Some(Action::Down));
         assert_eq!(map_key(key(KeyCode::Up)), Some(Action::Up));
+        assert_eq!(map_key(key(KeyCode::Char(' '))), Some(Action::Toggle));
         assert_eq!(map_key(key(KeyCode::Char('x'))), None);
     }
 
