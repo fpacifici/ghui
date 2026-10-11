@@ -1,6 +1,10 @@
 //! ghui — a terminal UI for GitHub.
 
 mod app;
+#[allow(dead_code)] // wired up in M4
+mod auth;
+#[allow(dead_code)] // wired up in M4
+mod config;
 mod event;
 mod ui;
 
