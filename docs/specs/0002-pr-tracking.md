@@ -63,9 +63,12 @@ statuses.
 
 ### Polling
 
-- Opening a repo tab for the first time fetches every tracked PR in it.
-- The selected PR is refreshed every 5 s while any check is pending, and
-  every 60 s once all checks have completed.
+- Opening a repo tab fetches every tracked PR in it (one GraphQL request).
+- While a tab is active its tracked PRs are re-fetched in that same single
+  request: every 5 s while the **selected** PR has pending checks (or has
+  not loaded yet), every 60 s once all its checks have completed. Inactive
+  tabs are not polled.
+- A repo that failed to load is retried every 60 s.
 - `r` refreshes the selected PR (and the open log) immediately.
 - When rate limited, polling pauses until the reset time and the status bar
   says so.
