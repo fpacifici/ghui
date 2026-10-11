@@ -11,6 +11,7 @@ use crate::app::{App, Focus, Modal};
 
 mod checks;
 mod detail;
+pub mod log_view;
 mod picker;
 mod pr_list;
 mod tabs;
@@ -34,6 +35,7 @@ pub fn render(app: &App, frame: &mut Frame) {
 
     match &app.modal {
         Some(Modal::Picker(p)) => picker::render(app, p, frame, body_area),
+        Some(Modal::Log(view)) => log_view::render(view, app.now, frame, frame.area()),
         None => {}
     }
 }
@@ -93,6 +95,9 @@ fn render_empty_config(app: &App, frame: &mut Frame, area: Rect) {
 fn footer(app: &App) -> Line<'static> {
     let keys = match (&app.modal, app.focus) {
         (Some(Modal::Picker(_)), _) => " esc close · j/k move · pgup/pgdn page · enter add",
+        (Some(Modal::Log(_)), _) => {
+            " esc close · j/k scroll · pgup/pgdn page · g/G top/bottom · r refresh · y copy url · o open"
+        }
         (None, Focus::List) => {
             " q quit · </> repo · → checks · j/k move · ^A add · d untrack · r refresh · y copy url · o open"
         }
@@ -140,7 +145,7 @@ pub(crate) fn elapsed(start: Option<DateTime<Utc>>, end: DateTime<Utc>) -> Strin
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::app::tests::{check, config, detail, loaded, t};
+    use crate::app::tests::{check, config, detail, job_id, loaded, t};
     use crate::app::{Msg, RepoState};
     use crate::config::Config;
     use crate::event::Action;
@@ -334,5 +339,83 @@ pub(crate) mod tests {
         assert!(out.contains("✓ #1 tracked  bob"));
         assert!(out.contains("#7 new one  bob [draft]"));
         assert!(out.contains("enter add"));
+    }
+
+    fn open_log(app: &mut App, check_index: usize) {
+        app.apply(Action::FocusRight);
+        for _ in 0..check_index {
+            app.apply(Action::Down);
+        }
+        app.apply(Action::Enter);
+        app.tick(t(20));
+    }
+
+    #[test]
+    fn log_window_shows_cleaned_lines_and_highlights_errors() {
+        let mut app = sample_app();
+        open_log(&mut app, 0); // "lint", failed
+        let out = text(&draw(&app, 100, 20));
+        assert!(out.contains("X lint · CI · 20s"));
+        assert!(out.contains("Loading log…"));
+
+        let raw = "\u{feff}2026-10-10T06:35:39.1Z ##[group]Run lint\n\
+                   2026-10-10T06:35:39.2Z checking\n\
+                   2026-10-10T06:35:39.3Z ##[error]1 warning treated as error\n";
+        app.handle(
+            Msg::Log {
+                repo: "o/a".into(),
+                job_id: job_id("lint"),
+                result: Ok(Some(raw.into())),
+            },
+            t(20),
+        );
+        let buffer = draw(&app, 100, 20);
+        let out = text(&buffer);
+        assert!(out.contains("▸ Run lint"));
+        assert!(out.contains("checking"));
+        assert!(!out.contains("2026-10-10T"));
+        let (x, y) = find(&buffer, "Error: 1 warning").unwrap();
+        assert_eq!(buffer[(x, y)].fg, Color::Red);
+        assert!(out.contains("1–3 / 3"));
+        assert!(out.contains("esc close"));
+    }
+
+    #[test]
+    fn running_job_without_log_says_so() {
+        let mut app = sample_app();
+        open_log(&mut app, 1); // "build", pending
+        app.handle(
+            Msg::Log {
+                repo: "o/a".into(),
+                job_id: job_id("build"),
+                result: Ok(None),
+            },
+            t(20),
+        );
+        let out = text(&draw(&app, 100, 20));
+        assert!(
+            out.contains("Job in progress — logs appear when it completes"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn non_actions_check_shows_its_summary_and_url() {
+        let mut app = sample_app();
+        let mut status = check("deploy", CheckState::Pass);
+        status.workflow = None;
+        status.kind = crate::github::CheckKind::Status {
+            description: Some("Deployed to preview".into()),
+        };
+        app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![status])))]), t(20));
+        open_log(&mut app, 0);
+        let out = text(&draw(&app, 100, 20));
+        assert!(out.contains("Deployed to preview"));
+        assert!(out.contains("Details: https://ci/deploy"));
+    }
+
+    #[test]
+    fn log_height_excludes_borders_and_footer() {
+        assert_eq!(log_view::height(ratatui::layout::Size::new(100, 20)), 17);
     }
 }

@@ -9,7 +9,8 @@ use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::config::Config;
 use crate::event::Action;
-use crate::github::{ApiError, PrDetail, PrResult, PrSummary};
+use crate::github::{ApiError, CheckKind, PrDetail, PrResult, PrSummary};
+use crate::log_view::LogView;
 
 /// Poll interval while the selected PR has pending checks.
 pub const FAST_POLL: TimeDelta = TimeDelta::seconds(5);
@@ -23,6 +24,7 @@ const RATE_LIMIT_BACKOFF: TimeDelta = TimeDelta::seconds(60);
 pub enum Effect {
     FetchPrs { repo: String, numbers: Vec<u64> },
     FetchOpenPrs { repo: String },
+    FetchLog { repo: String, job_id: u64 },
     SaveConfig(Config),
     CopyToClipboard(String),
     OpenUrl(String),
@@ -39,6 +41,11 @@ pub enum Msg {
         repo: String,
         result: Result<Vec<PrSummary>, ApiError>,
     },
+    Log {
+        repo: String,
+        job_id: u64,
+        result: Result<Option<String>, ApiError>,
+    },
 }
 
 /// Rows moved by `PgUp` / `PgDn` in lists.
@@ -48,6 +55,7 @@ const PAGE: isize = 10;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
     Picker(Picker),
+    Log(Box<LogView>),
 }
 
 /// The add-PR picker: open PRs of `repo`.
@@ -156,6 +164,9 @@ pub struct App {
     pub active: usize,
     pub focus: Focus,
     pub modal: Option<Modal>,
+    /// Visible lines in the log window; set by the main loop from the
+    /// terminal size so scrolling can clamp.
+    pub log_height: usize,
     /// Transient error shown above the footer; cleared by the next
     /// successful fetch.
     pub status: Option<String>,
@@ -179,6 +190,7 @@ impl App {
             active: 0,
             focus: Focus::default(),
             modal: None,
+            log_height: 20,
             status: None,
             rate_limited_until: None,
             now,
@@ -232,7 +244,11 @@ impl App {
             Action::PageUp => self.move_selection(-PAGE),
             Action::PageDown => self.move_selection(PAGE),
             Action::AddPr => return self.open_picker(),
-            Action::Close | Action::Enter => {}
+            Action::Enter => match self.focus {
+                Focus::List => self.focus = Focus::Checks,
+                Focus::Checks => self.open_log(),
+            },
+            Action::Close => {}
         }
         Vec::new()
     }
@@ -262,8 +278,48 @@ impl App {
                 picker.selected = step(picker.selected, delta, len);
                 self.modal = Some(Modal::Picker(picker));
             }
+            Modal::Log(mut log) => {
+                let height = self.log_height.max(1);
+                let page = isize::try_from(height).unwrap_or(isize::MAX);
+                let mut effects = Vec::new();
+                match action {
+                    Action::Up => log.scroll_by(-1, height),
+                    Action::Down => log.scroll_by(1, height),
+                    Action::PageUp => log.scroll_by(-page, height),
+                    Action::PageDown => log.scroll_by(page, height),
+                    Action::Top => log.scroll_by(isize::MIN, height),
+                    Action::Bottom => log.scroll_by(isize::MAX, height),
+                    Action::Refresh => log.refresh(),
+                    Action::OpenUrl | Action::CopyUrl => {
+                        if let Some(url) = log.check.url.clone() {
+                            effects.push(if action == Action::OpenUrl {
+                                Effect::OpenUrl(url)
+                            } else {
+                                Effect::CopyToClipboard(url)
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+                self.modal = Some(Modal::Log(log));
+                return effects;
+            }
         }
         Vec::new()
+    }
+
+    /// Opens the log window on the selected check.
+    fn open_log(&mut self) {
+        let Some(repo) = self.active_repo() else {
+            return;
+        };
+        let Some(detail) = repo.selected_detail() else {
+            return;
+        };
+        if let Some(check) = detail.checks.get(repo.selected_check) {
+            let view = LogView::new(repo.name.clone(), detail.number, check.clone());
+            self.modal = Some(Modal::Log(Box::new(view)));
+        }
     }
 
     fn open_picker(&mut self) -> Vec<Effect> {
@@ -322,6 +378,21 @@ impl App {
                     picker.selected = 0;
                 }
             }
+            Msg::Log {
+                repo,
+                job_id,
+                result,
+            } => {
+                if let Err(ApiError::RateLimited { reset }) = &result {
+                    self.rate_limited(*reset, now);
+                }
+                if let Some(Modal::Log(log)) = &mut self.modal
+                    && log.repo == repo
+                    && log.job_id() == Some(job_id)
+                {
+                    log.finish_fetch(result.map_err(|e| e.to_string()), now);
+                }
+            }
         }
     }
 
@@ -352,7 +423,50 @@ impl App {
                 });
             }
         }
+        effects.extend(self.tick_log(now));
         effects
+    }
+
+    fn rate_limited(&mut self, reset: Option<DateTime<Utc>>, now: DateTime<Utc>) {
+        let until = reset
+            .filter(|r| *r > now)
+            .unwrap_or(now + RATE_LIMIT_BACKOFF);
+        self.rate_limited_until = Some(until);
+        self.status = Some(format!(
+            "Rate limited — polling paused until {}",
+            until.format("%H:%M:%S UTC")
+        ));
+    }
+
+    /// Keeps the open log window's check in sync with the latest PR data
+    /// and schedules its log fetch.
+    fn tick_log(&mut self, now: DateTime<Utc>) -> Option<Effect> {
+        let Some(Modal::Log(log)) = &mut self.modal else {
+            return None;
+        };
+        let job_id = log.job_id()?;
+        let latest = self
+            .repos
+            .iter()
+            .find(|r| r.name == log.repo)
+            .and_then(|r| r.prs.iter().find(|p| p.number == log.pr))
+            .and_then(|p| p.detail.as_ref())
+            .and_then(|d| {
+                d.checks
+                    .iter()
+                    .find(|c| c.kind == CheckKind::ActionsJob { job_id })
+            });
+        if let Some(check) = latest {
+            log.check = check.clone();
+        }
+        if !log.poll_due(now) {
+            return None;
+        }
+        log.start_fetch();
+        Some(Effect::FetchLog {
+            repo: log.repo.clone(),
+            job_id,
+        })
     }
 
     /// Records a failure to save the config.
@@ -390,14 +504,8 @@ impl App {
                 self.status = None;
             }
             Err(ApiError::RateLimited { reset }) => {
-                let until = reset
-                    .filter(|r| *r > now)
-                    .unwrap_or(now + RATE_LIMIT_BACKOFF);
-                self.rate_limited_until = Some(until);
-                self.status = Some(format!(
-                    "Rate limited — polling paused until {}",
-                    until.format("%H:%M:%S UTC")
-                ));
+                repo.last_poll = Some(now);
+                return self.rate_limited(reset, now);
             }
             Err(e @ (ApiError::NotFound(_) | ApiError::Forbidden(_))) => repo.error = Some(e),
             Err(e) if !repo.has_loaded() => repo.error = Some(e),
@@ -504,8 +612,15 @@ pub(crate) mod tests {
             started_at: Some(t(-30)),
             completed_at: (state != CheckState::Pending).then(|| t(-10)),
             url: Some(format!("https://ci/{name}")),
-            kind: CheckKind::ActionsJob { job_id: 7 },
+            kind: CheckKind::ActionsJob {
+                job_id: job_id(name),
+            },
         }
+    }
+
+    /// A distinct fake job id per check name.
+    pub fn job_id(name: &str) -> u64 {
+        name.bytes().map(u64::from).sum()
     }
 
     pub fn detail(number: u64, checks: Vec<Check>) -> PrDetail {
@@ -858,5 +973,117 @@ pub(crate) mod tests {
         let mut app = App::new(Config::default(), "cfg".into(), t(0));
         assert!(app.apply(Action::AddPr).is_empty());
         assert!(app.status.as_deref().unwrap().contains("cfg"));
+    }
+
+    fn log_msg(job_id: u64, result: Result<Option<String>, ApiError>) -> Msg {
+        Msg::Log {
+            repo: "o/a".into(),
+            job_id,
+            result,
+        }
+    }
+
+    #[test]
+    fn enter_opens_the_log_of_the_selected_check_and_polls_it() {
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        app.tick(t(0));
+        let running = detail(1, vec![check("build", CheckState::Pending)]);
+        app.handle(loaded("o/a", vec![(1, Ok(running))]), t(0));
+
+        app.apply(Action::Enter);
+        assert_eq!(app.focus, Focus::Checks);
+        app.apply(Action::Enter);
+        assert!(matches!(app.modal, Some(Modal::Log(_))));
+        let fetch_log = Effect::FetchLog {
+            repo: "o/a".into(),
+            job_id: job_id("build"),
+        };
+        assert_eq!(app.tick(t(1)), vec![fetch_log.clone()]);
+        app.handle(log_msg(job_id("build"), Ok(None)), t(1));
+        let no_log_fetch = |effects: Vec<Effect>| {
+            effects
+                .iter()
+                .all(|e| !matches!(e, Effect::FetchLog { .. }))
+        };
+        assert!(no_log_fetch(app.tick(t(5))));
+
+        // The PR poll reports the job finished: the log window picks it up
+        // and fetches the final log.
+        app.handle(
+            loaded(
+                "o/a",
+                vec![(1, Ok(detail(1, vec![check("build", CheckState::Pass)])))],
+            ),
+            t(6),
+        );
+        assert_eq!(app.tick(t(6)), vec![fetch_log]);
+        app.handle(log_msg(job_id("build"), Ok(Some("done\n".into()))), t(6));
+        let Some(Modal::Log(view)) = &app.modal else {
+            panic!("log closed")
+        };
+        assert_eq!(view.check.state, CheckState::Pass);
+        assert_eq!(view.len(), 1);
+        assert!(
+            app.tick(t(100))
+                .iter()
+                .all(|e| !matches!(e, Effect::FetchLog { .. }))
+        );
+    }
+
+    #[test]
+    fn log_window_scrolls_opens_urls_and_closes() {
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        app.handle(
+            loaded(
+                "o/a",
+                vec![(1, Ok(detail(1, vec![check("build", CheckState::Pass)])))],
+            ),
+            t(0),
+        );
+        app.log_height = 10;
+        app.apply(Action::FocusRight);
+        app.apply(Action::Enter);
+        app.tick(t(0));
+        let log: String = (0..50).map(|i| format!("{i}\n")).collect();
+        app.handle(log_msg(job_id("build"), Ok(Some(log))), t(0));
+        let top = |app: &App| match &app.modal {
+            Some(Modal::Log(v)) => v.top(10),
+            _ => panic!("log closed"),
+        };
+        assert_eq!(top(&app), 40);
+        app.apply(Action::PageUp);
+        assert_eq!(top(&app), 30);
+        app.apply(Action::Top);
+        assert_eq!(top(&app), 0);
+        app.apply(Action::Down);
+        assert_eq!(top(&app), 1);
+        // Tab keys don't leak through to the main view.
+        app.apply(Action::NextRepo);
+        assert_eq!(
+            app.apply(Action::OpenUrl),
+            vec![Effect::OpenUrl("https://ci/build".into())]
+        );
+        app.apply(Action::Close);
+        assert_eq!(app.modal, None);
+    }
+
+    #[test]
+    fn log_results_for_another_job_are_ignored() {
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        app.handle(
+            loaded(
+                "o/a",
+                vec![(1, Ok(detail(1, vec![check("build", CheckState::Pass)])))],
+            ),
+            t(0),
+        );
+        app.apply(Action::FocusRight);
+        app.apply(Action::Enter);
+        app.tick(t(0));
+        app.handle(log_msg(99, Ok(Some("other".into()))), t(0));
+        let Some(Modal::Log(view)) = &app.modal else {
+            panic!("log closed")
+        };
+        assert_eq!(view.len(), 0);
     }
 }

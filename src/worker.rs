@@ -44,6 +44,17 @@ impl<G: GitHub> Worker<G> {
                 });
                 None
             }
+            Effect::FetchLog { repo, job_id } => {
+                self.runtime.spawn(async move {
+                    let result = github.job_log(&repo, job_id).await;
+                    let _ = results.send(Msg::Log {
+                        repo,
+                        job_id,
+                        result,
+                    });
+                });
+                None
+            }
             other => Some(other),
         }
     }

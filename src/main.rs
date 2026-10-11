@@ -8,6 +8,8 @@ mod auth;
 mod config;
 mod event;
 mod github;
+mod log_view;
+mod logs;
 mod ui;
 mod worker;
 
@@ -62,6 +64,7 @@ fn run<G: GitHub>(
 ) -> color_eyre::Result<()> {
     while app.running {
         terminal.draw(|frame| ui::render(&app, frame))?;
+        app.log_height = ui::log_view::height(terminal.size()?);
         if let Some(action) = event::next_action(INPUT_TIMEOUT)? {
             let effects = app.apply(action);
             execute(&mut app, worker, effects, config_path);
@@ -90,7 +93,7 @@ fn execute<G: GitHub>(app: &mut App, worker: &Worker<G>, effects: Vec<Effect>, c
             Effect::OpenUrl(url) => {
                 open::that_detached(&url).map_err(|e| format!("cannot open {url}: {e}"))
             }
-            Effect::FetchPrs { .. } | Effect::FetchOpenPrs { .. } => {
+            Effect::FetchPrs { .. } | Effect::FetchOpenPrs { .. } | Effect::FetchLog { .. } => {
                 unreachable!("network effects are spawned")
             }
         };
