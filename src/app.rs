@@ -829,6 +829,52 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn untracking_the_last_pr_empties_the_list_and_then_does_nothing() {
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        let effects = app.apply(Action::Untrack);
+        assert_eq!(effects, vec![Effect::SaveConfig(config(&[("o/a", &[])]))]);
+        assert!(app.repos[0].prs.is_empty());
+        assert_eq!(app.repos[0].selected_pr, 0);
+        assert!(app.apply(Action::Untrack).is_empty());
+    }
+
+    #[test]
+    fn results_for_an_untracked_pr_are_dropped() {
+        let mut app = App::new(config(&[("o/a", &[1, 2])]), "cfg".into(), t(0));
+        app.tick(t(0));
+        app.apply(Action::Untrack);
+        app.handle(
+            loaded(
+                "o/a",
+                vec![(1, Ok(detail(1, vec![]))), (2, Ok(detail(2, vec![])))],
+            ),
+            t(1),
+        );
+        let numbers: Vec<u64> = app.repos[0].prs.iter().map(|p| p.number).collect();
+        assert_eq!(numbers, vec![2]);
+        assert!(!app.is_tracked("o/a", 1));
+    }
+
+    #[test]
+    fn untrack_is_ignored_while_a_modal_is_open() {
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        open_picker_with(&mut app, &[1, 2]);
+        assert!(app.apply(Action::Untrack).is_empty());
+        assert!(matches!(app.modal, Some(Modal::Picker(_))));
+        app.apply(Action::Close);
+
+        let pending = detail(1, vec![check("build", CheckState::Pending)]);
+        app.handle(loaded("o/a", vec![(1, Ok(pending))]), t(1));
+        app.apply(Action::FocusRight);
+        app.apply(Action::Enter);
+        assert!(matches!(app.modal, Some(Modal::Log(_))));
+        assert!(app.apply(Action::Untrack).is_empty());
+        assert!(matches!(app.modal, Some(Modal::Log(_))));
+        assert!(app.is_tracked("o/a", 1));
+        assert_eq!(app.repos[0].prs.len(), 1);
+    }
+
+    #[test]
     fn copy_and_open_use_the_pr_or_focused_check_url() {
         let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
         assert!(app.apply(Action::CopyUrl).is_empty());

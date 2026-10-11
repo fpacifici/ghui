@@ -27,6 +27,7 @@ pub enum Action {
     Bottom,
     Enter,
     AddPr,
+    /// `Ctrl+D` or `d`: stop tracking the selected PR.
     Untrack,
     Refresh,
     CopyUrl,
@@ -50,6 +51,7 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         return match key.code {
             KeyCode::Char('c') => Some(Action::ForceQuit),
             KeyCode::Char('a') => Some(Action::AddPr),
+            KeyCode::Char('d') => Some(Action::Untrack),
             _ => None,
         };
     }
@@ -112,7 +114,9 @@ mod tests {
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
         assert_eq!(map_key(ctrl('c')), Some(Action::ForceQuit));
         assert_eq!(map_key(ctrl('a')), Some(Action::AddPr));
-        assert_eq!(map_key(ctrl('d')), None);
+        assert_eq!(map_key(ctrl('d')), Some(Action::Untrack));
+        assert_eq!(map_key(key(KeyCode::Char('d'))), Some(Action::Untrack));
+        assert_eq!(map_key(ctrl('x')), None);
     }
 
     #[test]
