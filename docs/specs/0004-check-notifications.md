@@ -37,11 +37,13 @@ repo tab is not active.
 
 ### Delivery
 
-- Native OS notification: Notification Center on macOS, the D-Bus
-  notification service on Linux.
+- Native OS notification: Notification Center on macOS, posted with
+  `osascript` (`display notification`), so it is attributed to Script
+  Editor; the D-Bus notification service on Linux.
 - Sending never blocks the UI. If the system refuses the notification (e.g.
-  no notification service on Linux) the error is shown in the status bar.
-  macOS does not report delivery failures.
+  no notification service on Linux, or `osascript` fails) the error is
+  shown in the status bar. macOS does not report notifications muted in
+  System Settings.
 
 ### Polling every tracked repo
 

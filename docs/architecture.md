@@ -51,6 +51,7 @@ without a terminal, network or real clock.
 | `log_view.rs`     | Log window state: content, scroll/follow, log poll bookkeeping.          | None                |
 | `scroll.rs`       | `Scroll`: top line and follow-the-end state shared by the log windows.   | None                |
 | `api_log.rs`      | API call log: `Request::of(&Effect)`, `ApiCall`, last 1000 calls.        | None                |
+| `notify.rs`       | Desktop notifications: `osascript` on macOS, `notify-rust` elsewhere.    | Runs `osascript` / D-Bus |
 | `logs.rs`         | Cleans raw Actions logs (BOM, timestamps, ANSI, `\r`, endgroup).         | None                |
 | `worker.rs`       | Turns network `Effect`s into tokio tasks that send back a `Msg`, preceded by a `Msg::ApiCall`. | Spawns tasks        |
 | `github/mod.rs`   | `GitHub` trait and domain types (`PrDetail`, `Check`, `ApiError`, …).    | None                |
@@ -105,7 +106,9 @@ its reset time.
 `App::handle_prs` compares each PR's new detail with the previous one and
 returns `Effect::Notify` when its checks went from pending to all complete.
 Since pending PRs are exactly what is polled, this works in every tab.
-`main.rs` sends it with `notify-rust` on a short-lived thread, so a slow
+`main.rs` sends it with `notify::send` (`osascript` on macOS, where
+`notify-rust`'s notifications are dropped; `notify-rust` elsewhere) on a
+short-lived thread, so a slow
 notification service never blocks the loop; failures come back as
 `Msg::NotifyFailed` and land in the status bar.
 
