@@ -93,6 +93,10 @@ open.
 
 ### Log view (`Enter` on a check)
 
+`Enter` on a running check opens it in the browser instead
+([spec 0005](0005-enter-opens-browser.md)); the log view opens for
+completed checks and for running checks without a URL.
+
 - Full-screen overlay titled with the check name and state.
 - For GitHub Actions jobs, the job log is shown with the per-line timestamp
   and ANSI escape codes removed. A failed job opens at the first `##[error]`
@@ -113,7 +117,7 @@ open.
 | `←` / `→`, `h` / `l`             | Focus PR list / checks                              |
 | `↑` / `↓`, `k` / `j`             | Move within the focused pane / scroll the log       |
 | `PgUp` / `PgDn`, `g` / `G`       | Page / jump to top or bottom (log view)             |
-| `Enter`                          | Open log view (checks) / add PR (picker)            |
+| `Enter`                          | Open PR in browser (list) / running check in browser, else log view (checks) / add PR (picker) |
 | `Ctrl+A`                         | Open the add-PR picker                              |
 | `Ctrl+D`, `d`                    | Untrack the selected PR                             |
 | `r`                              | Refresh now                                         |
