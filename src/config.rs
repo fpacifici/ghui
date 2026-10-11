@@ -118,6 +118,19 @@ impl Config {
         }
     }
 
+    /// Removes `pr` from `repo` without dismissing it, so autodetect may
+    /// add it back if it reopens. Returns `false` if it was not tracked.
+    pub fn remove(&mut self, repo: &str, pr: u64) -> bool {
+        match self.repos.iter_mut().find(|r| r.name == repo) {
+            Some(r) => {
+                let before = r.prs.len();
+                r.prs.retain(|n| *n != pr);
+                r.prs.len() != before
+            }
+            None => false,
+        }
+    }
+
     /// Whether the user untracked `pr` in `repo`.
     pub fn is_dismissed(&self, repo: &str, pr: u64) -> bool {
         self.repos
@@ -185,6 +198,16 @@ mod tests {
         assert!(config.untrack("a/b", 1));
         assert!(!config.untrack("a/b", 1));
         assert_eq!(config.repos[0].prs, vec![2]);
+    }
+
+    #[test]
+    fn remove_does_not_dismiss() {
+        let mut config = Config::parse("repos:\n  - name: a/b\n    prs: [1, 2]\n").unwrap();
+        assert!(config.remove("a/b", 1));
+        assert!(!config.remove("a/b", 1));
+        assert!(!config.remove("x/y", 2));
+        assert_eq!(config.repos[0].prs, vec![2]);
+        assert!(!config.is_dismissed("a/b", 1));
     }
 
     #[test]
