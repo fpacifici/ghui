@@ -307,8 +307,12 @@ impl App {
             Action::PageDown => self.move_selection(PAGE),
             Action::AddPr => return self.open_picker(),
             Action::Enter => match self.focus {
-                Focus::List => self.focus = Focus::Checks,
-                Focus::Checks => self.open_log(),
+                Focus::List => {
+                    if let Some(url) = self.selected_pr_url() {
+                        return vec![Effect::OpenUrl(url)];
+                    }
+                }
+                Focus::Checks => return self.enter_check(),
             },
             Action::Close => {}
         }
@@ -370,18 +374,26 @@ impl App {
         Vec::new()
     }
 
-    /// Opens the log window on the selected check.
-    fn open_log(&mut self) {
+    /// `Enter` on the selected check: a running check opens in the browser,
+    /// since the API has no live log; anything else opens the log window.
+    fn enter_check(&mut self) -> Vec<Effect> {
         let Some(repo) = self.active_repo() else {
-            return;
+            return Vec::new();
         };
         let Some(detail) = repo.selected_detail() else {
-            return;
+            return Vec::new();
         };
-        if let Some(check) = detail.checks.get(repo.selected_check) {
-            let view = LogView::new(repo.name.clone(), detail.number, check.clone());
-            self.modal = Some(Modal::Log(Box::new(view)));
+        let Some(check) = detail.checks.get(repo.selected_check) else {
+            return Vec::new();
+        };
+        if check.is_running()
+            && let Some(url) = &check.url
+        {
+            return vec![Effect::OpenUrl(url.clone())];
         }
+        let view = LogView::new(repo.name.clone(), detail.number, check.clone());
+        self.modal = Some(Modal::Log(Box::new(view)));
+        Vec::new()
     }
 
     fn open_picker(&mut self) -> Vec<Effect> {
@@ -1198,8 +1210,8 @@ pub(crate) mod tests {
         assert!(matches!(app.modal, Some(Modal::Picker(_))));
         app.apply(Action::Close);
 
-        let pending = detail(1, vec![check("build", CheckState::Pending)]);
-        app.handle(loaded("o/a", vec![(1, Ok(pending))]), t(1));
+        let passed = detail(1, vec![check("build", CheckState::Pass)]);
+        app.handle(loaded("o/a", vec![(1, Ok(passed))]), t(1));
         app.apply(Action::FocusRight);
         app.apply(Action::Enter);
         assert!(matches!(app.modal, Some(Modal::Log(_))));
@@ -1549,15 +1561,52 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn enter_opens_the_log_of_the_selected_check_and_polls_it() {
+    fn enter_opens_the_pr_and_running_checks_in_the_browser() {
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        assert!(app.apply(Action::Enter).is_empty());
+        let checks = vec![
+            check("build", CheckState::Pending),
+            check("lint", CheckState::Fail),
+        ];
+        app.handle(loaded("o/a", vec![(1, Ok(detail(1, checks)))]), t(0));
+
+        assert_eq!(
+            app.apply(Action::Enter),
+            vec![Effect::OpenUrl("https://github.com/o/r/pull/1".into())]
+        );
+        assert_eq!(app.focus, Focus::List);
+
+        app.apply(Action::FocusRight);
+        assert_eq!(
+            app.apply(Action::Enter),
+            vec![Effect::OpenUrl("https://ci/build".into())]
+        );
+        assert_eq!(app.modal, None);
+
+        app.apply(Action::Down);
+        assert!(app.apply(Action::Enter).is_empty());
+        assert!(matches!(&app.modal, Some(Modal::Log(v)) if v.check.name == "lint"));
+    }
+
+    #[test]
+    fn enter_on_a_pr_without_checks_in_the_checks_pane_does_nothing() {
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(0));
+        app.apply(Action::FocusRight);
+        assert!(app.apply(Action::Enter).is_empty());
+        assert_eq!(app.modal, None);
+    }
+
+    #[test]
+    fn enter_opens_the_log_of_a_running_check_without_url_and_polls_it() {
         let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
         app.tick(t(0));
-        let running = detail(1, vec![check("build", CheckState::Pending)]);
-        app.handle(loaded("o/a", vec![(1, Ok(running))]), t(0));
+        let mut build = check("build", CheckState::Pending);
+        build.url = None;
+        app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![build])))]), t(0));
 
-        app.apply(Action::Enter);
-        assert_eq!(app.focus, Focus::Checks);
-        app.apply(Action::Enter);
+        app.apply(Action::FocusRight);
+        assert!(app.apply(Action::Enter).is_empty());
         assert!(matches!(app.modal, Some(Modal::Log(_))));
         let fetch_log = Effect::FetchLog {
             repo: "o/a".into(),

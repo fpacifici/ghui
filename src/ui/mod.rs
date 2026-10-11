@@ -99,10 +99,10 @@ fn footer(app: &App) -> Line<'static> {
             " esc close · j/k scroll · pgup/pgdn page · g/G top/bottom · r refresh · y copy url · o open"
         }
         (None, Focus::List) => {
-            " q quit · </> repo · → checks · j/k move · ^A add · ^D untrack · r refresh · y copy url · o open"
+            " q quit · </> repo · → checks · j/k move · enter/o open · ^A add · ^D untrack · r refresh · y copy url"
         }
         (None, Focus::Checks) => {
-            " q quit · </> repo · ← PRs · j/k move · enter logs · r refresh · y copy url · o open check"
+            " q quit · </> repo · ← PRs · j/k move · enter logs/open running · r refresh · y copy url · o open check"
         }
     };
     Line::from(keys).dark_gray()
@@ -401,8 +401,14 @@ pub(crate) mod tests {
 
     #[test]
     fn running_job_without_log_says_so() {
-        let mut app = sample_app();
-        open_log(&mut app, 1); // "build", pending
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        // Running checks with a URL open in the browser; without one they
+        // open the log window.
+        let mut build = check("build", CheckState::Pending);
+        build.url = None;
+        app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![build])))]), t(0));
+        app.now = t(20);
+        open_log(&mut app, 0);
         app.handle(
             Msg::Log {
                 repo: "o/a".into(),
