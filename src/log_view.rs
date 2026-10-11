@@ -5,6 +5,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::github::{Check, CheckKind, CheckState};
 use crate::logs;
+use crate::scroll::Scroll;
 
 /// Re-fetch interval for the log of a running job.
 pub const LOG_POLL: TimeDelta = TimeDelta::seconds(5);
@@ -29,10 +30,7 @@ pub struct LogView {
     /// Kept up to date from the PR polls while the window is open.
     pub check: Check,
     pub content: LogContent,
-    /// Index of the top visible line when not following.
-    scroll: usize,
-    /// Stick to the end of the log (`tail -f`).
-    follow: bool,
+    scroll: Scroll,
     in_flight: bool,
     force: bool,
     last_fetch: Option<DateTime<Utc>>,
@@ -54,8 +52,7 @@ impl LogView {
             } else {
                 LogContent::Summary
             },
-            scroll: 0,
-            follow: true,
+            scroll: Scroll::default(),
             in_flight: false,
             force: false,
             last_fetch: None,
@@ -80,24 +77,16 @@ impl LogView {
 
     /// The top visible line for a viewport of `height` lines.
     pub fn top(&self, height: usize) -> usize {
-        let max = self.len().saturating_sub(height);
-        if self.follow {
-            max
-        } else {
-            self.scroll.min(max)
-        }
+        self.scroll.top(self.len(), height)
     }
 
     pub fn is_following(&self) -> bool {
-        self.follow
+        self.scroll.is_following()
     }
 
     /// Scrolls by `delta` lines; reaching the end turns following back on.
     pub fn scroll_by(&mut self, delta: isize, height: usize) {
-        let max = self.len().saturating_sub(height);
-        let top = self.top(height).saturating_add_signed(delta).min(max);
-        self.scroll = top;
-        self.follow = top == max;
+        self.scroll.scroll_by(delta, self.len(), height);
     }
 
     /// Whether a log request is due at `now`.
@@ -154,10 +143,9 @@ impl LogView {
         match logs::first_error(lines) {
             Some(index) if self.check.state == CheckState::Fail => {
                 // A little context above the error.
-                self.scroll = index.saturating_sub(3);
-                self.follow = false;
+                self.scroll.jump(index.saturating_sub(3));
             }
-            _ => self.follow = true,
+            _ => self.scroll.follow(),
         }
     }
 }

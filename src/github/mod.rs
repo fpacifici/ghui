@@ -23,12 +23,8 @@ pub trait GitHub: Send + Sync + 'static {
         steps: Option<u64>,
     ) -> impl Future<Output = Result<Vec<PrResult>, ApiError>> + Send;
 
-    /// The 50 most recently updated open PRs of `repo`.
-    fn open_prs(&self, repo: &str)
-    -> impl Future<Output = Result<Vec<PrSummary>, ApiError>> + Send;
-
-    /// The login of the authenticated user.
-    fn viewer_login(&self) -> impl Future<Output = Result<String, ApiError>> + Send;
+    /// The 50 most recently updated open PRs of `repo`, and the user's.
+    fn open_prs(&self, repo: &str) -> impl Future<Output = Result<OpenPrs, ApiError>> + Send;
 
     /// The plain-text log of an Actions job. `Ok(None)` means the log is
     /// not available (yet).
@@ -49,6 +45,24 @@ pub enum ApiError {
     RateLimited { reset: Option<DateTime<Utc>> },
     Network(String),
     Other(String),
+}
+
+impl ApiError {
+    /// A short error code for the API log, without the message.
+    pub fn code(&self) -> String {
+        match self {
+            ApiError::NotFound(_) => "not found".into(),
+            ApiError::Forbidden(_) => "forbidden".into(),
+            ApiError::RateLimited { .. } => "rate limited".into(),
+            ApiError::Network(_) => "network error".into(),
+            // HTTP failures read `502 Bad Gateway: …`; GraphQL ones carry
+            // only a message.
+            ApiError::Other(m) => match m.get(..3) {
+                Some(code) if code.bytes().all(|b| b.is_ascii_digit()) => code.into(),
+                _ => "error".into(),
+            },
+        }
+    }
 }
 
 impl std::fmt::Display for ApiError {
@@ -195,6 +209,15 @@ impl PrDetail {
     pub fn checks_running(&self) -> bool {
         self.checks.iter().any(Check::is_running)
     }
+}
+
+/// The add-PR picker's listings of a repo.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenPrs {
+    /// The 50 most recently updated open PRs.
+    pub all: Vec<PrSummary>,
+    /// Open PRs authored by the user, most recently updated first.
+    pub mine: Vec<PrSummary>,
 }
 
 /// A row of the add-PR picker.

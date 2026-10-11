@@ -1,6 +1,9 @@
 # 0005 — Untrack closed PRs automatically
 
-Status: Implemented
+Status: Superseded
+
+> Superseded by [0008-manual-tracking.md](0008-manual-tracking.md).
+
 
 Extends [0002-pr-tracking.md](0002-pr-tracking.md). Once a PR is merged or
 closed there is nothing left to watch, and removing each one with `d` is

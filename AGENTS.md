@@ -43,6 +43,8 @@ make check     # fmt-check + clippy + tests — run before every commit
 │   ├── app.rs                # App state; pure apply/handle/tick → Effects
 │   ├── check_tree.rs         # checks pane rows: runs → jobs → steps
 │   ├── log_view.rs           # log window state (scroll, follow, polling)
+│   ├── scroll.rs             # scroll position that can follow the end
+│   ├── api_log.rs            # log of the session's GitHub API calls
 │   ├── logs.rs               # cleaning of raw Actions logs
 │   ├── worker.rs             # network Effects → tokio tasks → Msg channel
 │   ├── github/               # GitHub trait, types, GraphQL, parsing, octocrab

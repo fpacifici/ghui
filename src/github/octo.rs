@@ -4,7 +4,7 @@ use http::StatusCode;
 use octocrab::Octocrab;
 use serde_json::{Value, json};
 
-use super::{ApiError, GitHub, PrResult, PrSummary, parse, query};
+use super::{ApiError, GitHub, OpenPrs, PrResult, parse, query};
 
 pub struct OctoGitHub {
     crab: Octocrab,
@@ -20,9 +20,15 @@ impl OctoGitHub {
         Ok(Self { crab })
     }
 
-    async fn graphql(&self, query: &str, repo: &str) -> Result<Value, ApiError> {
+    /// Runs `query` with `$owner` and `$name` set from `repo`, plus `extra`
+    /// variables.
+    async fn graphql(&self, query: &str, repo: &str, extra: Value) -> Result<Value, ApiError> {
         let (owner, name) = split_repo(repo)?;
-        let body = json!({ "query": query, "variables": { "owner": owner, "name": name } });
+        let mut variables = json!({ "owner": owner, "name": name });
+        if let (Some(vars), Value::Object(extra)) = (variables.as_object_mut(), extra) {
+            vars.extend(extra);
+        }
+        let body = json!({ "query": query, "variables": variables });
         self.crab
             .post("/graphql", Some(&body))
             .await
@@ -37,18 +43,16 @@ impl GitHub for OctoGitHub {
         numbers: &[u64],
         steps: Option<u64>,
     ) -> Result<Vec<PrResult>, ApiError> {
-        let response = self.graphql(&query::prs(numbers, steps), repo).await?;
+        let response = self
+            .graphql(&query::prs(numbers, steps), repo, Value::Null)
+            .await?;
         parse::prs(&response, numbers)
     }
 
-    async fn open_prs(&self, repo: &str) -> Result<Vec<PrSummary>, ApiError> {
-        let response = self.graphql(query::OPEN_PRS, repo).await?;
+    async fn open_prs(&self, repo: &str) -> Result<OpenPrs, ApiError> {
+        let mine = json!({ "mine": query::mine_search(repo) });
+        let response = self.graphql(query::OPEN_PRS, repo, mine).await?;
         parse::open_prs(&response)
-    }
-
-    async fn viewer_login(&self) -> Result<String, ApiError> {
-        let user = self.crab.current().user().await.map_err(map_err)?;
-        Ok(user.login)
     }
 
     async fn job_log(&self, repo: &str, job_id: u64) -> Result<Option<String>, ApiError> {
@@ -152,7 +156,6 @@ mod tests {
                 .await;
             assert!(matches!(missing, Err(ApiError::NotFound(_))), "{missing:?}");
             gh.open_prs("ratatui/ratatui").await.unwrap();
-            assert!(!gh.viewer_login().await.unwrap().is_empty());
         });
     }
 }

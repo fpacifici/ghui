@@ -8,7 +8,7 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
 use super::pane;
 use crate::app::{PrEntry, RepoState};
-use crate::github::Rollup;
+use crate::github::{PrState, Rollup};
 
 pub fn render(repo: &RepoState, focused: bool, frame: &mut Frame, area: Rect) {
     let block = pane(" PRs ".into(), focused);
@@ -27,7 +27,8 @@ pub fn render(repo: &RepoState, focused: bool, frame: &mut Frame, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// `● #123 Title`, the dot colored by the aggregate check state.
+/// `● #123 Title`, the dot colored by the aggregate check state, tagged
+/// `merged` or `closed` when no longer open.
 fn row(pr: &PrEntry) -> Line<'static> {
     let number = format!("#{}", pr.number);
     let Some(detail) = &pr.detail else {
@@ -43,8 +44,18 @@ fn row(pr: &PrEntry) -> Line<'static> {
         Rollup::Pending => Color::Yellow,
         Rollup::None => Color::DarkGray,
     };
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled("● ", Style::new().fg(color)),
         Span::raw(format!("{number} {}", detail.title)),
-    ])
+    ];
+    // Closed PRs stay until untracked by hand; see spec 0008.
+    let tag = match detail.state {
+        PrState::Open => None,
+        PrState::Merged => Some(" merged"),
+        PrState::Closed => Some(" closed"),
+    };
+    if let Some(tag) = tag {
+        spans.push(Span::styled(tag, Style::new().fg(Color::DarkGray)));
+    }
+    Line::from(spans)
 }

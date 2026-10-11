@@ -2,6 +2,9 @@
 
 Status: Implemented
 
+> The polling rules below are replaced by
+> [0008-manual-tracking.md](0008-manual-tracking.md).
+
 Extends [0002-pr-tracking.md](0002-pr-tracking.md). Waiting for CI means
 either staring at the TUI or forgetting to come back to it; ghui should tell
 the user when a watched PR's checks are done.

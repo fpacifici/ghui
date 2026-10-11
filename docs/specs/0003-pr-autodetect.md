@@ -1,6 +1,9 @@
 # 0003 — PR autodetect
 
-Status: Implemented
+Status: Superseded
+
+> Superseded by [0008-manual-tracking.md](0008-manual-tracking.md).
+
 
 Extends [0002-pr-tracking.md](0002-pr-tracking.md). Adding your own PRs one
 by one with `Ctrl+A` is tedious; ghui should notice them by itself.

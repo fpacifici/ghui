@@ -1,5 +1,6 @@
 //! ghui — a terminal UI that tracks GitHub PRs and their checks.
 
+mod api_log;
 mod app;
 mod auth;
 mod check_tree;
@@ -8,6 +9,7 @@ mod event;
 mod github;
 mod log_view;
 mod logs;
+mod scroll;
 mod ui;
 mod worker;
 
@@ -114,10 +116,9 @@ fn execute<G: GitHub>(app: &mut App, worker: &Worker<G>, effects: Vec<Effect>, l
                 });
                 Ok(())
             }
-            Effect::FetchPrs { .. }
-            | Effect::FetchOpenPrs { .. }
-            | Effect::FetchViewer
-            | Effect::FetchLog { .. } => unreachable!("network effects are spawned"),
+            Effect::FetchPrs { .. } | Effect::FetchOpenPrs { .. } | Effect::FetchLog { .. } => {
+                unreachable!("network effects are spawned")
+            }
         };
         if let Err(message) = result {
             app.report_error(message);

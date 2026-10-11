@@ -17,7 +17,7 @@ pub fn render(app: &App, frame: &mut Frame, area: Rect) {
         };
         Line::styled(repo.name.clone(), style)
     });
-    // The refresh "button": `r` re-fetches every tab and looks for new PRs.
+    // The refresh "button": `r` re-fetches every tab.
     let refresh = if app.refreshing {
         Line::from(" ⟳ refreshing… ").yellow()
     } else {

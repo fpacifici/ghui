@@ -25,10 +25,12 @@ The main loop in `main.rs` is synchronous and repeats:
 2. **Input** — `event::next_action` waits up to 100 ms for a key and maps it
    to an `Action`; `App::apply` returns `Effect`s.
 3. **Results** — every `Msg` waiting on the channel goes to `App::handle`,
-   which may return `Effect`s too (e.g. saving autodetected PRs).
+   which may return `Effect`s too (e.g. check notifications).
 4. **Timers** — `App::tick(now)` returns the polls that are due.
 5. **Effects** — network effects are spawned on the tokio runtime by
-   `worker::Worker`; the rest (config save, clipboard, browser) run inline,
+   `worker::Worker`, which reports each completed request as a
+   `Msg::ApiCall` (stamped with when it was sent) before its result, for
+   the API log ([spec 0009](specs/0009-api-log.md)); the rest (config save, clipboard, browser) run inline,
    except desktop notifications, which get a thread of their own.
 
 `App` never performs I/O. Everything it wants done is an `Effect`, and
@@ -42,18 +44,20 @@ without a terminal, network or real clock.
 |-------------------|--------------------------------------------------------------------------|---------------------|
 | `main.rs`         | Auth + config before the TUI, tokio runtime, main loop, local effects.   | Terminal, files, stdout, desktop notifications |
 | `auth.rs`         | Token from `GH_TOKEN` → `GITHUB_TOKEN` → `gh auth token`.                | Runs `gh`           |
-| `config.rs`       | `~/.ghui/config.yaml`: load, create if missing, atomic save, track/untrack/dismiss/remove. | Files (load/save only) |
+| `config.rs`       | `~/.ghui/config.yaml`: load, create if missing, atomic save, track/untrack. | Files (load/save only) |
 | `event.rs`        | `Action` enum, context-free `map_key`.                                    | Reads stdin events  |
 | `app.rs`          | `App` state (repos, focus, modal, status), `apply` / `handle` / `tick`.  | None                |
 | `check_tree.rs`   | Checks pane rows: workflow runs → jobs → steps, folds.                   | None                |
 | `log_view.rs`     | Log window state: content, scroll/follow, log poll bookkeeping.          | None                |
+| `scroll.rs`       | `Scroll`: top line and follow-the-end state shared by the log windows.   | None                |
+| `api_log.rs`      | API call log: `Request::of(&Effect)`, `ApiCall`, last 1000 calls.        | None                |
 | `logs.rs`         | Cleans raw Actions logs (BOM, timestamps, ANSI, `\r`, endgroup).         | None                |
-| `worker.rs`       | Turns network `Effect`s into tokio tasks that send back a `Msg`.         | Spawns tasks        |
+| `worker.rs`       | Turns network `Effect`s into tokio tasks that send back a `Msg`, preceded by a `Msg::ApiCall`. | Spawns tasks        |
 | `github/mod.rs`   | `GitHub` trait and domain types (`PrDetail`, `Check`, `ApiError`, …).    | None                |
 | `github/query.rs` | GraphQL documents.                                                       | None                |
 | `github/parse.rs` | GraphQL JSON → domain types; tested against `tests/fixtures/`.           | None                |
 | `github/octo.rs`  | `GitHub` implemented with octocrab; HTTP error mapping.                  | Network             |
-| `ui/`             | Pure rendering: tabs, PR list, detail, checks, picker, log window.       | None                |
+| `ui/`             | Pure rendering: tabs, PR list, detail, checks, picker, log windows.      | None                |
 
 ## GitHub access
 
@@ -67,8 +71,10 @@ without a terminal, network or real clock.
   the active tab's selected PR uses the `PrSteps` fragment
   (`Effect::FetchPrs { steps }`); the others use `Pr`. Selecting another PR
   forces a poll so its steps load right away.
-- **Open PRs** (picker and autodetect): GraphQL, 50 most recently updated.
-- **Viewer login** (autodetect): `GET /user`, once per session.
+- **Open PRs** (picker only, [spec 0008](specs/0008-manual-tracking.md)):
+  one GraphQL request with the repo's 50 most recently updated open PRs
+  and a `search` for the user's (`author:@me`), so the picker's mine/all
+  switch needs no further request and no login lookup.
 - **Logs**: `GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs`, which
   redirects to a short-lived download URL. A check run's GraphQL
   `databaseId` is the Actions job id. A 404 means "no log yet".
@@ -78,45 +84,34 @@ without a terminal, network or real clock.
 
 ## Polling
 
-The active tab's PRs are re-fetched every 5 s while the selected PR has
-pending checks, every 60 s otherwise (and every 60 s for a repo that failed
-to load). The interval is evaluated on each tick against the current
-selection, so selecting a running PR speeds polling up immediately.
-Inactive tabs are fetched once at start-up and then every 60 s only while
-one of their PRs has pending checks; switching to a tab refreshes it.
+See [spec 0008](specs/0008-manual-tracking.md). Every tab is fetched in
+full once at start-up. After that a tab is polled every 30 s
+(`CHECK_POLL`), active or not, only while some of its PRs have pending
+checks, and only those PRs are fetched (`RepoState::pending`); the active
+tab's selected PR gets its steps if it is among them. A tab with nothing
+pending is not polled. A full fetch (`RepoState::full_fetch`) happens when
+`force` is set — `r` on every tab, switching tabs, selecting or adding a
+PR, after a rate limit — and on retries of the active tab when it failed
+to load (every 60 s, `RETRY_POLL`).
 
 **Manual refresh** ([spec 0006](specs/0006-refresh-all.md)): `r` sets
-`force` and `detect_force` on every repo, so the next tick fetches every
-tab's PRs (dropping closed ones) and lists every loaded tab's open PRs
-(adding the user's new ones), whatever the schedule. `App::refreshing`
-drives the tab bar's `⟳ refreshing…` label until no repo is forced or in
-flight. An open log window for a running Actions job re-fetches the log
-every 5 s and does one final fetch after the job completes. A rate limit
-pauses all polling until its reset time.
+`force` on every repo. `App::refreshing` drives the tab bar's
+`⟳ refreshing…` label until no repo is forced or in flight. An open log
+window for a running Actions job re-fetches the log every 5 s and does one
+final fetch after the job completes. A rate limit pauses all polling until
+its reset time.
 
 **Check notifications** ([spec 0004](specs/0004-check-notifications.md)):
 `App::handle_prs` compares each PR's new detail with the previous one and
 returns `Effect::Notify` when its checks went from pending to all complete.
+Since pending PRs are exactly what is polled, this works in every tab.
 `main.rs` sends it with `notify-rust` on a short-lived thread, so a slow
 notification service never blocks the loop; failures come back as
 `Msg::NotifyFailed` and land in the status bar.
 
-**Autodetect** ([spec 0003](specs/0003-pr-autodetect.md)) rides the same
-`App::tick`: the first tick with a repo configured looks up the user's
-login (`Effect::FetchViewer`, retried every 60 s on failure, then cached
-in `App`). Once known, the active, non-failed repo's open PRs are listed
-(`Effect::FetchOpenPrs`, the picker's effect) every 60 s. Every
-`Msg::OpenPrs` — from autodetect or the picker — goes through
-`App::autodetect`, which tracks the user's PRs that are neither tracked nor
-dismissed and returns `Effect::SaveConfig`. `Config::untrack` records the
-PR in the repo's `dismissed` list and `Config::track` clears it, so
-untracking with the UI key suppresses re-detection for free.
-
-**Closed PRs** ([spec 0005](specs/0005-auto-untrack-closed.md)) are
-dropped in `App::handle_prs`: any PR whose fetched state is merged or
-closed is removed from the tab and from the config with `Config::remove`,
-which, unlike `untrack`, does not dismiss it, and `Effect::SaveConfig` is
-returned after any notification effects.
+**Tracking is manual.** Nothing lists open PRs in the background and
+merged or closed PRs are never dropped: the picker (`Picker::visible`
+filters the listing by mine/all and number prefix) adds, `Ctrl+D` removes.
 
 ## Design rules
 

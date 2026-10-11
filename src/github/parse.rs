@@ -5,7 +5,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::query::pr_alias;
-use super::{ApiError, Check, CheckKind, CheckState, PrDetail, PrResult, PrState, PrSummary, Step};
+use super::{
+    ApiError, Check, CheckKind, CheckState, OpenPrs, PrDetail, PrResult, PrState, PrSummary, Step,
+};
 
 /// Parses the response to [`super::query::prs`].
 pub fn prs(response: &Value, numbers: &[u64]) -> Result<Vec<PrResult>, ApiError> {
@@ -33,7 +35,16 @@ pub fn prs(response: &Value, numbers: &[u64]) -> Result<Vec<PrResult>, ApiError>
 }
 
 /// Parses the response to [`super::query::OPEN_PRS`].
-pub fn open_prs(response: &Value) -> Result<Vec<PrSummary>, ApiError> {
+pub fn open_prs(response: &Value) -> Result<OpenPrs, ApiError> {
+    let errors = graphql_errors(response);
+    let repo = repository(response, &errors)?;
+    Ok(OpenPrs {
+        all: summaries(repo.pointer("/pullRequests/nodes"))?,
+        mine: summaries(response.pointer("/data/mine/nodes"))?,
+    })
+}
+
+fn summaries(nodes: Option<&Value>) -> Result<Vec<PrSummary>, ApiError> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Raw {
@@ -44,14 +55,12 @@ pub fn open_prs(response: &Value) -> Result<Vec<PrSummary>, ApiError> {
         author: Option<Login>,
     }
 
-    let errors = graphql_errors(response);
-    let repo = repository(response, &errors)?;
-    let nodes = repo
-        .pointer("/pullRequests/nodes")
-        .cloned()
-        .unwrap_or(Value::Array(vec![]));
-    let raw: Vec<Raw> =
-        serde_json::from_value(nodes).map_err(|e| ApiError::Other(e.to_string()))?;
+    let raw: Vec<Raw> = match nodes {
+        Some(nodes) => {
+            serde_json::from_value(nodes.clone()).map_err(|e| ApiError::Other(e.to_string()))?
+        }
+        None => Vec::new(),
+    };
     Ok(raw
         .into_iter()
         .map(|r| PrSummary {
@@ -425,9 +434,12 @@ mod tests {
     #[test]
     fn parses_open_prs() {
         let prs = open_prs(&fixture("open_prs.json")).unwrap();
-        assert_eq!(prs.len(), 3);
-        assert_eq!(prs[0].number, 2825);
-        assert_eq!(prs[0].author, "joshka");
+        assert_eq!(prs.all.len(), 3);
+        assert_eq!(prs.all[0].number, 2825);
+        assert_eq!(prs.all[0].author, "joshka");
+        assert_eq!(prs.mine.len(), 1);
+        assert_eq!(prs.mine[0].number, 2740);
+        assert_eq!(prs.mine[0].author, "shafai-pouya");
     }
 
     fn pr_with(contexts: Value) -> Value {
