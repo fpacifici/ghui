@@ -122,7 +122,8 @@ pub struct RepoState {
     pub selected_pr: usize,
     pub selected_check: usize,
     in_flight: bool,
-    /// Refresh on the next tick regardless of the schedule.
+    /// Refresh on the next tick regardless of the schedule, even when the
+    /// tab is inactive or failed to load.
     force: bool,
     /// When the last fetch completed; `None` means a fetch is due now.
     last_poll: Option<DateTime<Utc>>,
@@ -130,6 +131,8 @@ pub struct RepoState {
     detect_in_flight: bool,
     /// Autodetect: when the last open-PR listing completed.
     last_detect: Option<DateTime<Utc>>,
+    /// Autodetect: list open PRs on the next tick, even when inactive.
+    detect_force: bool,
 }
 
 impl RepoState {
@@ -145,6 +148,7 @@ impl RepoState {
             last_poll: None,
             detect_in_flight: false,
             last_detect: None,
+            detect_force: false,
         }
     }
 
@@ -168,10 +172,13 @@ impl RepoState {
 
     /// Whether a fetch is due at `now`. Inactive tabs are only polled in
     /// the background until their first load and while checks run, so
-    /// their completions can still notify.
+    /// their completions can still notify, or when refreshed by hand.
     fn poll_due(&self, active: bool, now: DateTime<Utc>) -> bool {
         if self.in_flight {
             return false;
+        }
+        if self.force {
+            return true;
         }
         let interval = if active {
             self.poll_interval()
@@ -182,7 +189,7 @@ impl RepoState {
         };
         // The interval depends on the selection, so it is evaluated here
         // rather than when the previous fetch completed.
-        self.force || self.last_poll.is_none_or(|last| now >= last + interval)
+        self.last_poll.is_none_or(|last| now >= last + interval)
     }
 
     fn poll_interval(&self) -> TimeDelta {
@@ -246,6 +253,8 @@ pub struct App {
     /// Time of the last tick; used to render elapsed times.
     pub now: DateTime<Utc>,
     pub running: bool,
+    /// A manual refresh (`r`) has PR fetches pending; shown in the tab bar.
+    pub refreshing: bool,
     viewer: Viewer,
 }
 
@@ -268,6 +277,7 @@ impl App {
             rate_limited_until: None,
             now,
             running: true,
+            refreshing: false,
             viewer: Viewer::default(),
         }
     }
@@ -299,11 +309,7 @@ impl App {
             Action::Down => self.move_selection(1),
             Action::Top => self.move_selection(isize::MIN),
             Action::Bottom => self.move_selection(isize::MAX),
-            Action::Refresh => {
-                if let Some(repo) = self.active_repo_mut() {
-                    repo.force = true;
-                }
-            }
+            Action::Refresh => self.refresh_all(),
             Action::Untrack => return self.untrack_selected(),
             Action::CopyUrl => {
                 if let Some(url) = self.selected_pr_url() {
@@ -545,6 +551,9 @@ impl App {
     /// Advances the clock and returns the polls that are due.
     pub fn tick(&mut self, now: DateTime<Utc>) -> Vec<Effect> {
         self.now = now;
+        if !self.repos.iter().any(|r| r.force || r.in_flight) {
+            self.refreshing = false;
+        }
         if let Some(until) = self.rate_limited_until {
             if now < until {
                 return Vec::new();
@@ -587,22 +596,31 @@ impl App {
     }
 
     /// Lists the active repo's open PRs every [`DETECT_POLL`] once the
-    /// user's login is known, so their new PRs get tracked.
-    fn tick_detect(&mut self, now: DateTime<Utc>) -> Option<Effect> {
-        self.viewer.login.as_ref()?;
-        let repo = self.repos.get_mut(self.active)?;
-        let due = repo.error.is_none()
-            && !repo.detect_in_flight
-            && repo
-                .last_detect
-                .is_none_or(|last| now >= last + DETECT_POLL);
-        if !due {
-            return None;
+    /// user's login is known, so their new PRs get tracked; and any repo's
+    /// right away after a manual refresh.
+    fn tick_detect(&mut self, now: DateTime<Utc>) -> Vec<Effect> {
+        if self.viewer.login.is_none() {
+            return Vec::new();
         }
-        repo.detect_in_flight = true;
-        Some(Effect::FetchOpenPrs {
-            repo: repo.name.clone(),
-        })
+        let active = self.active;
+        self.repos
+            .iter_mut()
+            .enumerate()
+            .filter(|(i, repo)| {
+                let scheduled = *i == active
+                    && repo
+                        .last_detect
+                        .is_none_or(|last| now >= last + DETECT_POLL);
+                repo.error.is_none() && !repo.detect_in_flight && (repo.detect_force || scheduled)
+            })
+            .map(|(_, repo)| {
+                repo.detect_in_flight = true;
+                repo.detect_force = false;
+                Effect::FetchOpenPrs {
+                    repo: repo.name.clone(),
+                }
+            })
+            .collect()
     }
 
     fn rate_limited(&mut self, reset: Option<DateTime<Utc>>, now: DateTime<Utc>) {
@@ -720,6 +738,17 @@ impl App {
             list.join(", ")
         ));
         Effect::SaveConfig(self.config.clone())
+    }
+
+    /// `r`: re-fetches every tab, which drops merged and closed PRs, and
+    /// lists every tab's open PRs, which adds the user's new ones; see
+    /// spec 0006.
+    fn refresh_all(&mut self) {
+        self.refreshing = !self.repos.is_empty();
+        for repo in &mut self.repos {
+            repo.force = true;
+            repo.detect_force = true;
+        }
     }
 
     fn switch_repo(&mut self, step: usize) {
@@ -960,6 +989,67 @@ pub(crate) mod tests {
         app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(60));
         app.handle(loaded("o/b", vec![(2, Ok(done))]), t(60));
         assert_eq!(app.tick(t(120)), vec![fetch("o/a", &[1])]);
+    }
+
+    #[test]
+    fn refresh_refetches_every_tab_and_drops_closed_prs() {
+        let mut app = App::new(
+            config(&[("o/a", &[1]), ("o/b", &[2, 3])]),
+            "cfg".into(),
+            t(0),
+        );
+        app.tick(t(0));
+        app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(0));
+        let open = vec![(2, Ok(detail(2, vec![]))), (3, Ok(detail(3, vec![])))];
+        app.handle(loaded("o/b", open), t(0));
+        // A quiet inactive tab is not polled by itself...
+        assert_eq!(app.tick(t(1000)), vec![fetch("o/a", &[1])]);
+        app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(1000));
+        // ...but `r` refreshes every tab.
+        app.apply(Action::Refresh);
+        assert!(app.refreshing);
+        assert_eq!(
+            app.tick(t(1001)),
+            vec![fetch("o/a", &[1]), fetch("o/b", &[2, 3])]
+        );
+        assert!(app.refreshing);
+        let effects = app.handle(
+            loaded(
+                "o/b",
+                vec![
+                    (2, Ok(with_state(2, PrState::Merged, vec![]))),
+                    (3, Ok(detail(3, vec![]))),
+                ],
+            ),
+            t(1002),
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::SaveConfig(config(&[("o/a", &[1]), ("o/b", &[3])]))]
+        );
+        assert!(!app.is_tracked("o/b", 2));
+        app.tick(t(1002));
+        assert!(app.refreshing, "o/a is still in flight");
+        app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(1002));
+        app.tick(t(1003));
+        assert!(!app.refreshing);
+    }
+
+    #[test]
+    fn refresh_retries_a_failed_tab() {
+        let mut app = App::new(config(&[("o/a", &[1]), ("o/b", &[2])]), "cfg".into(), t(0));
+        app.tick(t(0));
+        app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(0));
+        let err = ApiError::Network("down".into());
+        app.handle(
+            Msg::Prs {
+                repo: "o/b".into(),
+                result: Err(err),
+            },
+            t(0),
+        );
+        app.apply(Action::Refresh);
+        assert!(app.tick(t(1)).contains(&fetch("o/b", &[2])));
     }
 
     #[test]
@@ -1428,6 +1518,35 @@ pub(crate) mod tests {
         app.apply(Action::NextRepo);
         assert!(app.tick(t(64)).contains(&list_open("o/b")));
         assert!(!app.tick(t(200)).contains(&list_open("o/a")));
+    }
+
+    #[test]
+    fn refresh_detects_new_prs_in_every_tab_once() {
+        let mut app = detecting_app(&[("o/a", &[]), ("o/b", &[])]);
+        app.handle(loaded("o/a", vec![]), t(0));
+        app.handle(loaded("o/b", vec![]), t(0));
+        app.tick(t(1));
+        app.handle(open_prs("o/a", vec![]), t(1));
+        assert!(app.tick(t(2)).is_empty());
+
+        app.apply(Action::Refresh);
+        let effects = app.tick(t(2));
+        assert!(effects.contains(&list_open("o/a")), "{effects:?}");
+        assert!(effects.contains(&list_open("o/b")), "{effects:?}");
+        app.handle(open_prs("o/a", vec![]), t(3));
+        let effects = app.handle(open_prs("o/b", vec![by("me", 4)]), t(3));
+        assert_eq!(
+            effects,
+            vec![Effect::SaveConfig(config(&[("o/a", &[]), ("o/b", &[4])]))]
+        );
+        assert_eq!(app.active, 0);
+        // The new PR is fetched right away, in the background, and the
+        // inactive tab is not listed again.
+        app.handle(loaded("o/a", vec![]), t(3));
+        app.handle(loaded("o/b", vec![]), t(3));
+        let effects = app.tick(t(4));
+        assert!(effects.contains(&fetch("o/b", &[4])), "{effects:?}");
+        assert!(!effects.contains(&list_open("o/b")), "{effects:?}");
     }
 
     #[test]

@@ -71,7 +71,9 @@ statuses.
   tabs are polled in the background only as described in
   [0004-check-notifications.md](0004-check-notifications.md).
 - A repo that failed to load is retried every 60 s.
-- `r` refreshes the selected PR (and the open log) immediately.
+- `r` refreshes every tab immediately and looks for new PRs
+  ([0006-refresh-all.md](0006-refresh-all.md)); in the log window it
+  refreshes the log.
 - When rate limited, polling pauses until the reset time and the status bar
   says so.
 
@@ -120,7 +122,7 @@ completed checks and for running checks without a URL.
 | `Enter`                          | Open PR in browser (list) / running check in browser, else log view (checks) / add PR (picker) |
 | `Ctrl+A`                         | Open the add-PR picker                              |
 | `Ctrl+D`, `d`                    | Untrack the selected PR                             |
-| `r`                              | Refresh now                                         |
+| `r`                              | Refresh every tab (0006) / the log                  |
 | `y`                              | Copy the PR URL to the clipboard (OSC 52)           |
 | `o`                              | Open the PR (or the focused check) in the browser   |
 | `Esc`                            | Close the modal                                     |

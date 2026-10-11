@@ -219,6 +219,16 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tab_bar_shows_the_refresh_button() {
+        let mut app = sample_app();
+        let out = text(&draw(&app, 120, 30));
+        assert!(out.lines().next().unwrap().contains("⟳ r refresh"), "{out}");
+        app.apply(Action::Refresh);
+        let out = text(&draw(&app, 120, 30));
+        assert!(out.lines().next().unwrap().contains("refreshing…"), "{out}");
+    }
+
+    #[test]
     fn footer_advertises_ctrl_d_untrack_in_the_pr_list_only() {
         let mut app = sample_app();
         let out = text(&draw(&app, 140, 30));

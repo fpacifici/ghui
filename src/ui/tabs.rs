@@ -17,8 +17,17 @@ pub fn render(app: &App, frame: &mut Frame, area: Rect) {
         };
         Line::styled(repo.name.clone(), style)
     });
+    // The refresh "button": `r` re-fetches every tab and looks for new PRs.
+    let refresh = if app.refreshing {
+        Line::from(" ⟳ refreshing… ").yellow()
+    } else {
+        Line::from(vec![" ⟳ ".into(), "r".bold(), " refresh ".into()])
+    };
+    let block = Block::bordered()
+        .title(" ghui ".bold())
+        .title_top(refresh.right_aligned());
     let tabs = Tabs::new(titles)
-        .block(Block::bordered().title(" ghui ".bold()))
+        .block(block)
         .select(Some(app.active))
         // Style-only highlight so a dimmed tab stays dimmed when selected.
         .highlight_style(Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED));

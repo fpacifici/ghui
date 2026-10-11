@@ -12,6 +12,7 @@ acceptance criteria; implementation details belong in
 | [0004-check-notifications.md](0004-check-notifications.md) | Implemented |
 | [0005-auto-untrack-closed.md](0005-auto-untrack-closed.md) | Implemented |
 | [0005-enter-opens-browser.md](0005-enter-opens-browser.md) | Implemented |
+| [0006-refresh-all.md](0006-refresh-all.md) | Implemented |
 
 ## Template
 
