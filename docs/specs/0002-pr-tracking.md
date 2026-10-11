@@ -45,8 +45,8 @@ with a message telling the user to set `GH_TOKEN` or run `gh auth login`.
    error in the body. Network errors are retried on the next poll.
 2. **PR list** (left, narrow) — one row per tracked PR:
    `● #123 Title…`. The dot is the aggregate check state (green success, red
-   failure, yellow pending, gray none). Merged/closed PRs are tagged
-   `[merged]` / `[closed]` and stay until untracked.
+   failure, yellow pending, gray none). Merged/closed PRs are untracked
+   automatically (see [0005-auto-untrack-closed.md](0005-auto-untrack-closed.md)).
 3. **Detail** (right):
    - Top third: a header line with author, `head → base`, state and the PR
      URL, followed by the raw markdown description, truncated to fit.
@@ -133,7 +133,7 @@ completed checks and for running checks without a URL.
 - [x] Auth falls back GH_TOKEN → GITHUB_TOKEN → `gh auth token`, and exits
       with a clear error otherwise.
 - [x] One tab per repo; inaccessible repos are dimmed and show their error.
-- [x] PR list shows aggregate status, number, title and merged/closed tags.
+- [x] PR list shows aggregate status, number and title.
 - [x] Detail shows header with URL, raw description (top third) and checks.
 - [x] The selected PR's checks refresh every 5 s while pending, 60 s after.
 - [x] Picker lists 50 open PRs, marks tracked ones and adds on Enter.

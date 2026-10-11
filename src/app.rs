@@ -9,7 +9,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::config::Config;
 use crate::event::Action;
-use crate::github::{ApiError, CheckKind, CheckState, PrDetail, PrResult, PrSummary};
+use crate::github::{ApiError, CheckKind, CheckState, PrDetail, PrResult, PrState, PrSummary};
 use crate::log_view::LogView;
 
 /// Poll interval while the selected PR has pending checks.
@@ -196,6 +196,18 @@ impl RepoState {
             },
             None => SLOW_POLL,
         }
+    }
+
+    /// Drops the PRs `numbers`. The selected PR stays selected; if it is
+    /// dropped the selection stays at the same row, on the first check.
+    fn remove_prs(&mut self, numbers: &[u64]) {
+        let selected = self.selected().map(|p| p.number);
+        self.prs.retain(|p| !numbers.contains(&p.number));
+        match selected.and_then(|n| self.prs.iter().position(|p| p.number == n)) {
+            Some(i) => self.selected_pr = i,
+            None => self.selected_check = 0,
+        }
+        self.clamp_selection();
     }
 
     fn clamp_selection(&mut self) {
@@ -646,14 +658,16 @@ impl App {
         result: Result<Vec<PrResult>, ApiError>,
         now: DateTime<Utc>,
     ) -> Vec<Effect> {
-        let Some(repo) = self.repos.iter_mut().find(|r| r.name == name) else {
+        let Some(repo_index) = self.repos.iter().position(|r| r.name == name) else {
             return Vec::new();
         };
+        let repo = &mut self.repos[repo_index];
         repo.in_flight = false;
         let mut effects = Vec::new();
         match result {
             Ok(results) => {
                 repo.error = None;
+                let mut closed = Vec::new();
                 for (number, result) in results {
                     // PRs untracked while the request was in flight are skipped.
                     let Some(entry) = repo.prs.iter_mut().find(|p| p.number == number) else {
@@ -662,6 +676,9 @@ impl App {
                     match result {
                         Ok(detail) => {
                             effects.extend(checks_finished(name, entry.detail.as_ref(), &detail));
+                            if detail.state != PrState::Open {
+                                closed.push(number);
+                            }
                             entry.detail = Some(detail);
                             entry.error = None;
                         }
@@ -670,6 +687,9 @@ impl App {
                 }
                 repo.clamp_selection();
                 self.status = None;
+                if !closed.is_empty() {
+                    effects.push(self.untrack_closed(repo_index, &closed));
+                }
             }
             Err(ApiError::RateLimited { reset }) => {
                 repo.last_poll = Some(now);
@@ -681,8 +701,25 @@ impl App {
             // Keep showing the last good data.
             Err(e) => self.status = Some(format!("{}: refresh failed: {e}", repo.name)),
         }
-        repo.last_poll = Some(now);
+        self.repos[repo_index].last_poll = Some(now);
         effects
+    }
+
+    /// Drops merged and closed PRs from a tab and the config without
+    /// dismissing them; see spec 0005.
+    fn untrack_closed(&mut self, repo_index: usize, numbers: &[u64]) -> Effect {
+        let repo = &mut self.repos[repo_index];
+        repo.remove_prs(numbers);
+        for number in numbers {
+            self.config.remove(&repo.name, *number);
+        }
+        let list: Vec<String> = numbers.iter().map(|n| format!("#{n}")).collect();
+        self.status = Some(format!(
+            "{}: untracked closed {}",
+            repo.name,
+            list.join(", ")
+        ));
+        Effect::SaveConfig(self.config.clone())
     }
 
     fn switch_repo(&mut self, step: usize) {
@@ -721,9 +758,7 @@ impl App {
         let Some(number) = repo.selected().map(|p| p.number) else {
             return Vec::new();
         };
-        repo.prs.retain(|p| p.number != number);
-        repo.selected_check = 0;
-        repo.clamp_selection();
+        repo.remove_prs(&[number]);
         self.config.untrack(&repo.name, number);
         vec![Effect::SaveConfig(self.config.clone())]
     }
@@ -1159,6 +1194,84 @@ pub(crate) mod tests {
         app.apply(Action::Down);
         assert_eq!(app.repos[0].selected_check, 0);
         assert_eq!(app.tick(t(6)).len(), 1);
+    }
+
+    fn with_state(number: u64, state: PrState, checks: Vec<Check>) -> PrDetail {
+        PrDetail {
+            state,
+            ..detail(number, checks)
+        }
+    }
+
+    #[test]
+    fn closed_and_merged_prs_are_untracked_without_dismissal() {
+        let mut app = App::new(config(&[("o/a", &[1, 2, 3, 4])]), "cfg".into(), t(0));
+        // Select #4 on its second check.
+        app.repos[0].selected_pr = 3;
+        app.repos[0].selected_check = 1;
+        app.tick(t(0));
+        let checks = vec![check("a", CheckState::Pass), check("b", CheckState::Pass)];
+        let effects = app.handle(
+            loaded(
+                "o/a",
+                vec![
+                    (1, Ok(with_state(1, PrState::Merged, vec![]))),
+                    (2, Ok(detail(2, vec![]))),
+                    (3, Ok(with_state(3, PrState::Closed, vec![]))),
+                    (4, Ok(detail(4, checks))),
+                ],
+            ),
+            t(1),
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::SaveConfig(config(&[("o/a", &[2, 4])]))]
+        );
+        let numbers: Vec<u64> = app.repos[0].prs.iter().map(|p| p.number).collect();
+        assert_eq!(numbers, vec![2, 4]);
+        assert_eq!(app.repos[0].selected().unwrap().number, 4);
+        assert_eq!(app.repos[0].selected_check, 1);
+        assert!(!app.config.is_dismissed("o/a", 1));
+        assert_eq!(app.status.as_deref(), Some("o/a: untracked closed #1, #3"));
+        // The next poll only asks for the open PRs.
+        app.apply(Action::Refresh);
+        assert_eq!(app.tick(t(2)), vec![fetch("o/a", &[2, 4])]);
+    }
+
+    #[test]
+    fn closing_the_selected_pr_keeps_the_row_and_resets_the_check() {
+        let mut app = App::new(config(&[("o/a", &[1, 2])]), "cfg".into(), t(0));
+        app.repos[0].selected_pr = 1;
+        app.repos[0].selected_check = 1;
+        let checks = vec![check("a", CheckState::Pass), check("b", CheckState::Pass)];
+        app.handle(
+            loaded(
+                "o/a",
+                vec![
+                    (1, Ok(detail(1, checks))),
+                    (2, Ok(with_state(2, PrState::Merged, vec![]))),
+                ],
+            ),
+            t(0),
+        );
+        assert_eq!(app.repos[0].selected().unwrap().number, 1);
+        assert_eq!(app.repos[0].selected_check, 0);
+    }
+
+    #[test]
+    fn a_pr_merged_as_its_checks_finish_still_notifies() {
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
+        let running = detail(1, vec![check("build", CheckState::Pending)]);
+        app.handle(loaded("o/a", vec![(1, Ok(running))]), t(0));
+        let merged = with_state(1, PrState::Merged, vec![check("build", CheckState::Pass)]);
+        assert_eq!(
+            app.handle(loaded("o/a", vec![(1, Ok(merged))]), t(5)),
+            vec![
+                notify("Checks passed", "o/a #1 PR 1"),
+                Effect::SaveConfig(config(&[("o/a", &[])]))
+            ]
+        );
+        assert!(app.repos[0].prs.is_empty());
     }
 
     #[test]

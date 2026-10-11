@@ -149,7 +149,7 @@ pub(crate) mod tests {
     use crate::app::{Msg, RepoState};
     use crate::config::Config;
     use crate::event::Action;
-    use crate::github::{ApiError, CheckState, PrState};
+    use crate::github::{ApiError, CheckState};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -194,8 +194,7 @@ pub(crate) mod tests {
             ],
         );
         one.body = "## Summary\nDoes things.".into();
-        let mut two = detail(2, vec![]);
-        two.state = PrState::Merged;
+        let two = detail(2, vec![]);
         app.handle(loaded("o/a", vec![(1, Ok(one)), (2, Ok(two))]), t(0));
         app.now = t(20);
         app
@@ -207,7 +206,7 @@ pub(crate) mod tests {
         assert!(out.contains("o/a"));
         assert!(out.contains("o/b"));
         assert!(out.contains("#1 PR 1"));
-        assert!(out.contains("#2 PR 2 [merged]"));
+        assert!(out.contains("#2 PR 2"));
         assert!(out.contains("me · feature → main · open"));
         assert!(out.contains("https://github.com/o/r/pull/1"));
         assert!(out.contains("## Summary"));
@@ -235,7 +234,7 @@ pub(crate) mod tests {
         app.apply(Action::Untrack);
         let out = text(&draw(&app, 120, 30));
         assert!(!out.contains("#1 PR 1"), "{out}");
-        assert!(out.contains("#2 PR 2 [merged]"), "{out}");
+        assert!(out.contains("#2 PR 2"), "{out}");
     }
 
     #[test]

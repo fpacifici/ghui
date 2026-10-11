@@ -42,7 +42,7 @@ without a terminal, network or real clock.
 |-------------------|--------------------------------------------------------------------------|---------------------|
 | `main.rs`         | Auth + config before the TUI, tokio runtime, main loop, local effects.   | Terminal, files, stdout, desktop notifications |
 | `auth.rs`         | Token from `GH_TOKEN` → `GITHUB_TOKEN` → `gh auth token`.                | Runs `gh`           |
-| `config.rs`       | `~/.ghui/config.yaml`: load, create if missing, atomic save, track/untrack/dismiss. | Files (load/save only) |
+| `config.rs`       | `~/.ghui/config.yaml`: load, create if missing, atomic save, track/untrack/dismiss/remove. | Files (load/save only) |
 | `event.rs`        | `Action` enum, context-free `map_key`.                                    | Reads stdin events  |
 | `app.rs`          | `App` state (repos, focus, modal, status), `apply` / `handle` / `tick`.  | None                |
 | `log_view.rs`     | Log window state: content, scroll/follow, log poll bookkeeping.          | None                |
@@ -96,8 +96,14 @@ in `App`). Once known, the active, non-failed repo's open PRs are listed
 `Msg::OpenPrs` — from autodetect or the picker — goes through
 `App::autodetect`, which tracks the user's PRs that are neither tracked nor
 dismissed and returns `Effect::SaveConfig`. `Config::untrack` records the
-PR in the repo's `dismissed` list and `Config::track` clears it, so any
-untrack path (UI key or otherwise) suppresses re-detection for free.
+PR in the repo's `dismissed` list and `Config::track` clears it, so
+untracking with the UI key suppresses re-detection for free.
+
+**Closed PRs** ([spec 0005](specs/0005-auto-untrack-closed.md)) are
+dropped in `App::handle_prs`: any PR whose fetched state is merged or
+closed is removed from the tab and from the config with `Config::remove`,
+which, unlike `untrack`, does not dismiss it, and `Effect::SaveConfig` is
+returned after any notification effects.
 
 ## Design rules
 
