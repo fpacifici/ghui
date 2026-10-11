@@ -54,7 +54,9 @@ with a message telling the user to set `GH_TOKEN` or run `gh auth login`.
      (`2 failing, 1 pending, 10 successful`), then one row per check with a
      status glyph (`✓` pass, `X` fail — including cancelled and timed out,
      `*` pending, `-` skipped/neutral; same buckets as `gh pr checks`), name, workflow or context, and elapsed time. Failing first,
-     then pending, then passing/other.
+     then pending, then passing/other. Actions jobs are grouped under
+     their workflow run, with their steps; see
+     [0007-check-tree.md](0007-check-tree.md).
 4. **Status bar** — transient errors (failed poll, config write failure,
    rate limiting). Cleared by the next successful poll.
 5. **Footer** — key bindings.
@@ -116,7 +118,8 @@ completed checks and for running checks without a URL.
 | Key                              | Action                                              |
 |----------------------------------|-----------------------------------------------------|
 | `<` / `>`, `Shift+Tab` / `Tab`   | Previous / next repo tab                            |
-| `←` / `→`, `h` / `l`             | Focus PR list / checks                              |
+| `←` / `→`, `h` / `l`             | Focus PR list / checks; fold in the checks tree (0007) |
+| `Space`                          | Expand / collapse in the checks tree (0007)         |
 | `↑` / `↓`, `k` / `j`             | Move within the focused pane / scroll the log       |
 | `PgUp` / `PgDn`, `g` / `G`       | Page / jump to top or bottom (log view)             |
 | `Enter`                          | Open PR in browser (list) / running check in browser, else log view (checks) / add PR (picker) |

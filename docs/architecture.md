@@ -45,6 +45,7 @@ without a terminal, network or real clock.
 | `config.rs`       | `~/.ghui/config.yaml`: load, create if missing, atomic save, track/untrack/dismiss/remove. | Files (load/save only) |
 | `event.rs`        | `Action` enum, context-free `map_key`.                                    | Reads stdin events  |
 | `app.rs`          | `App` state (repos, focus, modal, status), `apply` / `handle` / `tick`.  | None                |
+| `check_tree.rs`   | Checks pane rows: workflow runs → jobs → steps, folds.                   | None                |
 | `log_view.rs`     | Log window state: content, scroll/follow, log poll bookkeeping.          | None                |
 | `logs.rs`         | Cleans raw Actions logs (BOM, timestamps, ANSI, `\r`, endgroup).         | None                |
 | `worker.rs`       | Turns network `Effect`s into tokio tasks that send back a `Msg`.         | Spawns tasks        |
@@ -61,6 +62,11 @@ without a terminal, network or real clock.
   head commit's `statusCheckRollup`, which carries both check runs and
   legacy commit statuses. A repo with no tracked PRs still resolves the
   repository, which doubles as an access check.
+- **Job steps** ([spec 0007](specs/0007-check-tree.md)): `CheckRun.steps`
+  nested under 100 check runs multiplies a query's rate-limit cost, so only
+  the active tab's selected PR uses the `PrSteps` fragment
+  (`Effect::FetchPrs { steps }`); the others use `Pr`. Selecting another PR
+  forces a poll so its steps load right away.
 - **Open PRs** (picker and autodetect): GraphQL, 50 most recently updated.
 - **Viewer login** (autodetect): `GET /user`, once per session.
 - **Logs**: `GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs`, which
@@ -130,5 +136,16 @@ returned after any notification effects.
 - `make test` runs everything offline.
 - `cargo test -- --ignored live_` runs a smoke test against the real API
   (needs a token).
+
+## Checks tree
+
+`check_tree::rows(detail, folds)` turns a PR's flat, sorted checks into the
+visible rows of the checks pane ([spec 0007](specs/0007-check-tree.md)):
+Actions jobs grouped under their workflow run (`Check::run_id`), steps
+under their job, other checks top-level. Runs and jobs that are running are
+expanded unless the user's override in `RepoState::folds` (keyed by run or
+job id) says otherwise. `RepoState::selected_check` is a row index into
+this list; `App` and `ui` both call `RepoState::check_rows`, so key handling
+and rendering always agree.
 
 See [specs/](specs/) for feature-level behaviour.

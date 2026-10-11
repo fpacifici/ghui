@@ -31,8 +31,13 @@ impl OctoGitHub {
 }
 
 impl GitHub for OctoGitHub {
-    async fn fetch_prs(&self, repo: &str, numbers: &[u64]) -> Result<Vec<PrResult>, ApiError> {
-        let response = self.graphql(&query::prs(numbers), repo).await?;
+    async fn fetch_prs(
+        &self,
+        repo: &str,
+        numbers: &[u64],
+        steps: Option<u64>,
+    ) -> Result<Vec<PrResult>, ApiError> {
+        let response = self.graphql(&query::prs(numbers, steps), repo).await?;
         parse::prs(&response, numbers)
     }
 
@@ -126,7 +131,10 @@ mod tests {
         rt.block_on(async {
             let token = crate::auth::token().expect("token");
             let gh = OctoGitHub::new(token).unwrap();
-            let prs = gh.fetch_prs("fpacifici/assistant", &[69]).await.unwrap();
+            let prs = gh
+                .fetch_prs("fpacifici/assistant", &[69], Some(69))
+                .await
+                .unwrap();
             let pr = prs[0].1.as_ref().unwrap();
             let job_id = pr
                 .checks
@@ -138,7 +146,10 @@ mod tests {
                 .unwrap();
             let log = gh.job_log("fpacifici/assistant", job_id).await.unwrap();
             assert!(log.unwrap().contains("Current runner version"));
-            let missing = gh.fetch_prs("fpacifici/does-not-exist-xyz", &[]).await;
+            assert!(!pr.checks[0].steps.is_empty());
+            let missing = gh
+                .fetch_prs("fpacifici/does-not-exist-xyz", &[], None)
+                .await;
             assert!(matches!(missing, Err(ApiError::NotFound(_))), "{missing:?}");
             gh.open_prs("ratatui/ratatui").await.unwrap();
             assert!(!gh.viewer_login().await.unwrap().is_empty());

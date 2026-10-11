@@ -7,6 +7,7 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
 
+use crate::check_tree::{self, Folds, Node, Row};
 use crate::config::Config;
 use crate::event::Action;
 use crate::github::{ApiError, CheckKind, CheckState, PrDetail, PrResult, PrState, PrSummary};
@@ -28,6 +29,8 @@ pub enum Effect {
     FetchPrs {
         repo: String,
         numbers: Vec<u64>,
+        /// The PR to fetch job steps for; see spec 0007.
+        steps: Option<u64>,
     },
     FetchOpenPrs {
         repo: String,
@@ -120,7 +123,10 @@ pub struct RepoState {
     /// Repo-wide failure; the tab is dimmed while set.
     pub error: Option<ApiError>,
     pub selected_pr: usize,
+    /// Row of the checks tree; see [`RepoState::check_rows`].
     pub selected_check: usize,
+    /// Manual expand/collapse of runs and jobs in the checks tree.
+    pub folds: Folds,
     in_flight: bool,
     /// Refresh on the next tick regardless of the schedule, even when the
     /// tab is inactive or failed to load.
@@ -143,6 +149,7 @@ impl RepoState {
             error: None,
             selected_pr: 0,
             selected_check: 0,
+            folds: Folds::new(),
             in_flight: false,
             force: false,
             last_poll: None,
@@ -158,6 +165,17 @@ impl RepoState {
 
     pub fn selected_detail(&self) -> Option<&PrDetail> {
         self.selected().and_then(|p| p.detail.as_ref())
+    }
+
+    /// The visible rows of the selected PR's checks tree.
+    pub fn check_rows(&self) -> Vec<Row<'_>> {
+        self.selected_detail()
+            .map(|d| check_tree::rows(d, &self.folds))
+            .unwrap_or_default()
+    }
+
+    fn selected_row(&self) -> Option<Row<'_>> {
+        self.check_rows().into_iter().nth(self.selected_check)
     }
 
     fn has_loaded(&self) -> bool {
@@ -217,10 +235,62 @@ impl RepoState {
         self.clamp_selection();
     }
 
+    /// Expands or collapses the selected run or job; whether it changed.
+    fn set_fold(&mut self, expanded: bool) -> bool {
+        let Some((fold, current)) = self.selected_row().and_then(|r| r.fold) else {
+            return false;
+        };
+        if current == expanded {
+            return false;
+        }
+        self.folds.insert(fold, expanded);
+        true
+    }
+
+    /// `←` in the checks tree: collapses the selected row, or else selects
+    /// its parent. `false` when neither applies (a top-level row).
+    fn fold_left(&mut self) -> bool {
+        if self.set_fold(false) {
+            return true;
+        }
+        let rows = self.check_rows();
+        let Some(depth) = rows.get(self.selected_check).map(|r| r.depth) else {
+            return false;
+        };
+        let parent = rows[..self.selected_check]
+            .iter()
+            .rposition(|r| r.depth < depth);
+        match parent {
+            Some(parent) => {
+                self.selected_check = parent;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `Space` in the checks tree: toggles the selected run or job; on a
+    /// step, collapses its job and selects it.
+    fn toggle_fold(&mut self) {
+        let selected = self
+            .selected_row()
+            .map(|r| (r.fold, matches!(r.node, Node::Step { .. })));
+        match selected {
+            Some((Some((fold, expanded)), _)) => {
+                self.folds.insert(fold, !expanded);
+            }
+            Some((None, true)) => {
+                self.fold_left();
+                self.set_fold(false);
+            }
+            _ => {}
+        }
+    }
+
     fn clamp_selection(&mut self) {
         self.selected_pr = self.selected_pr.min(self.prs.len().saturating_sub(1));
-        let checks = self.selected_detail().map_or(0, |d| d.checks.len());
-        self.selected_check = self.selected_check.min(checks.saturating_sub(1));
+        let rows = self.check_rows().len();
+        self.selected_check = self.selected_check.min(rows.saturating_sub(1));
     }
 }
 
@@ -303,8 +373,15 @@ impl App {
             Action::ForceQuit | Action::Quit => self.running = false,
             Action::NextRepo => self.switch_repo(1),
             Action::PreviousRepo => self.switch_repo(self.repos.len().saturating_sub(1)),
-            Action::FocusLeft => self.focus = Focus::List,
-            Action::FocusRight => self.focus = Focus::Checks,
+            Action::FocusLeft => self.focus_left(),
+            Action::FocusRight => self.focus_right(),
+            Action::Toggle => {
+                if self.focus == Focus::Checks
+                    && let Some(repo) = self.active_repo_mut()
+                {
+                    repo.toggle_fold();
+                }
+            }
             Action::Up => self.move_selection(-1),
             Action::Down => self.move_selection(1),
             Action::Top => self.move_selection(isize::MIN),
@@ -392,8 +469,33 @@ impl App {
         Vec::new()
     }
 
-    /// `Enter` on the selected check: a running check opens in the browser,
-    /// since the API has no live log; anything else opens the log window.
+    /// `←`: in the checks tree, collapses the selected row or moves to its
+    /// parent; from the top level, focuses the PR list.
+    fn focus_left(&mut self) {
+        if self.focus == Focus::Checks
+            && let Some(repo) = self.active_repo_mut()
+            && repo.fold_left()
+        {
+            return;
+        }
+        self.focus = Focus::List;
+    }
+
+    /// `→`: focuses the checks, or expands the selected row there.
+    fn focus_right(&mut self) {
+        match self.focus {
+            Focus::List => self.focus = Focus::Checks,
+            Focus::Checks => {
+                if let Some(repo) = self.active_repo_mut() {
+                    repo.set_fold(true);
+                }
+            }
+        }
+    }
+
+    /// `Enter` on the selected row of the checks tree: a run toggles; a
+    /// running job (or its step) opens in the browser, since the API has no
+    /// live log; any other job or check opens the log window.
     fn enter_check(&mut self) -> Vec<Effect> {
         let Some(repo) = self.active_repo() else {
             return Vec::new();
@@ -401,13 +503,19 @@ impl App {
         let Some(detail) = repo.selected_detail() else {
             return Vec::new();
         };
-        let Some(check) = detail.checks.get(repo.selected_check) else {
+        let Some(row) = repo.selected_row() else {
+            return Vec::new();
+        };
+        let Some(check) = row.check() else {
+            if let Some(repo) = self.active_repo_mut() {
+                repo.toggle_fold();
+            }
             return Vec::new();
         };
         if check.is_running()
-            && let Some(url) = &check.url
+            && let Some(url) = row.url()
         {
-            return vec![Effect::OpenUrl(url.clone())];
+            return vec![Effect::OpenUrl(url)];
         }
         let view = LogView::new(repo.name.clone(), detail.number, check.clone());
         self.modal = Some(Modal::Log(Box::new(view)));
@@ -563,12 +671,15 @@ impl App {
         }
         let mut effects = Vec::new();
         for (i, repo) in self.repos.iter_mut().enumerate() {
-            if repo.poll_due(i == self.active, now) {
+            let active = i == self.active;
+            if repo.poll_due(active, now) {
                 repo.in_flight = true;
                 repo.force = false;
                 effects.push(Effect::FetchPrs {
                     repo: repo.name.clone(),
                     numbers: repo.prs.iter().map(|p| p.number).collect(),
+                    // Steps are costly, so only the PR on screen gets them.
+                    steps: repo.selected().filter(|_| active).map(|p| p.number),
                 });
             }
         }
@@ -771,10 +882,12 @@ impl App {
                 repo.selected_pr = step(repo.selected_pr, delta, repo.prs.len());
                 if repo.selected_pr != before {
                     repo.selected_check = 0;
+                    // Only the selected PR is fetched with its job steps.
+                    repo.force = true;
                 }
             }
             Focus::Checks => {
-                let len = repo.selected_detail().map_or(0, |d| d.checks.len());
+                let len = repo.check_rows().len();
                 repo.selected_check = step(repo.selected_check, delta, len);
             }
         }
@@ -796,15 +909,15 @@ impl App {
         Some(self.active_repo()?.selected_detail()?.url.clone())
     }
 
-    /// The selected check's URL when the checks pane is focused, else the
+    /// The selected row's URL when the checks pane is focused, else the
     /// PR's.
     fn focused_url(&self) -> Option<String> {
-        let detail = self.active_repo()?.selected_detail()?;
-        if self.focus == Focus::Checks {
-            let check = detail.checks.get(self.active_repo()?.selected_check);
-            if let Some(url) = check.and_then(|c| c.url.clone()) {
-                return Some(url);
-            }
+        let repo = self.active_repo()?;
+        let detail = repo.selected_detail()?;
+        if self.focus == Focus::Checks
+            && let Some(url) = repo.selected_row().and_then(|r| r.url())
+        {
+            return Some(url);
         }
         Some(detail.url.clone())
     }
@@ -878,6 +991,8 @@ pub(crate) mod tests {
             kind: CheckKind::ActionsJob {
                 job_id: job_id(name),
             },
+            run_id: None,
+            steps: Vec::new(),
         }
     }
 
@@ -907,11 +1022,27 @@ pub(crate) mod tests {
         }
     }
 
+    /// A poll of the active tab, with steps for its selected (first) PR.
     fn fetch(repo: &str, numbers: &[u64]) -> Effect {
         Effect::FetchPrs {
             repo: repo.into(),
             numbers: numbers.to_vec(),
+            steps: numbers.first().copied(),
         }
+    }
+
+    /// A poll with steps for PR `steps`.
+    fn fetch_with(repo: &str, numbers: &[u64], steps: Option<u64>) -> Effect {
+        Effect::FetchPrs {
+            repo: repo.into(),
+            numbers: numbers.to_vec(),
+            steps,
+        }
+    }
+
+    /// A background poll of an inactive tab, without steps.
+    fn fetch_bg(repo: &str, numbers: &[u64]) -> Effect {
+        fetch_with(repo, numbers, None)
     }
 
     #[test]
@@ -925,7 +1056,7 @@ pub(crate) mod tests {
             app.tick(t(0)),
             vec![
                 fetch("o/a", &[1, 2]),
-                fetch("o/b", &[3]),
+                fetch_bg("o/b", &[3]),
                 Effect::FetchViewer
             ]
         );
@@ -982,7 +1113,7 @@ pub(crate) mod tests {
         assert!(app.tick(t(59)).is_empty());
         assert_eq!(
             app.tick(t(60)),
-            vec![fetch("o/a", &[1]), fetch("o/b", &[2])]
+            vec![fetch("o/a", &[1]), fetch_bg("o/b", &[2])]
         );
 
         let done = detail(2, vec![check("build", CheckState::Pass)]);
@@ -1010,7 +1141,7 @@ pub(crate) mod tests {
         assert!(app.refreshing);
         assert_eq!(
             app.tick(t(1001)),
-            vec![fetch("o/a", &[1]), fetch("o/b", &[2, 3])]
+            vec![fetch("o/a", &[1]), fetch_bg("o/b", &[2, 3])]
         );
         assert!(app.refreshing);
         let effects = app.handle(
@@ -1049,7 +1180,7 @@ pub(crate) mod tests {
             t(0),
         );
         app.apply(Action::Refresh);
-        assert!(app.tick(t(1)).contains(&fetch("o/b", &[2])));
+        assert!(app.tick(t(1)).contains(&fetch_bg("o/b", &[2])));
     }
 
     #[test]
@@ -1066,6 +1197,11 @@ pub(crate) mod tests {
             t(0),
         );
         assert_eq!(app.tick(t(60)), vec![fetch("o/a", &[1])]);
+        assert!(
+            app.tick(t(1000))
+                .iter()
+                .all(|e| *e != fetch_bg("o/b", &[2]))
+        );
     }
 
     fn notify(title: &str, body: &str) -> Effect {
@@ -1286,6 +1422,149 @@ pub(crate) mod tests {
         assert_eq!(app.tick(t(6)).len(), 1);
     }
 
+    /// PR 1 with run 7: a failed `lint` job and a running `test` job, both
+    /// with steps, plus a passed commit status.
+    fn tree_app() -> App {
+        let step = |number, state| crate::github::Step {
+            number,
+            name: format!("step {number}"),
+            state,
+            started_at: Some(t(0)),
+            completed_at: None,
+        };
+        let mut lint = check("lint", CheckState::Fail);
+        lint.run_id = Some(7);
+        lint.steps = vec![step(1, CheckState::Fail)];
+        let mut test = check("test", CheckState::Pending);
+        test.run_id = Some(7);
+        test.url = Some("https://github.com/o/r/actions/runs/7/job/2".into());
+        test.steps = vec![step(1, CheckState::Pass), step(2, CheckState::Pending)];
+        let mut status = check("ext", CheckState::Pass);
+        status.kind = CheckKind::Status { description: None };
+        let mut app = App::new(config(&[("o/a", &[1, 2])]), "cfg".into(), t(0));
+        app.tick(t(0));
+        let checks = vec![lint, test, status];
+        app.handle(
+            loaded(
+                "o/a",
+                vec![(1, Ok(detail(1, checks))), (2, Ok(detail(2, vec![])))],
+            ),
+            t(0),
+        );
+        app.focus = Focus::Checks;
+        app
+    }
+
+    /// Rows of the checks tree, as `name` per row.
+    fn outline(app: &App) -> Vec<String> {
+        app.repos[0]
+            .check_rows()
+            .iter()
+            .map(|row| match &row.node {
+                Node::Run(run) => run.name.to_string(),
+                Node::Check(check) => check.name.clone(),
+                Node::Step { job, step } => format!("{}/{}", job.name, step.name),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn checks_tree_folds_with_arrows_space_and_enter() {
+        let mut app = tree_app();
+        let all = ["CI", "lint", "test", "test/step 1", "test/step 2", "ext"];
+        assert_eq!(outline(&app), all);
+
+        // → expands the failed job; ← on its step goes back to it, then
+        // collapses it.
+        app.apply(Action::Down);
+        app.apply(Action::FocusRight);
+        assert_eq!(outline(&app)[2], "lint/step 1");
+        app.apply(Action::Down);
+        app.apply(Action::FocusLeft);
+        assert_eq!(app.repos[0].selected_check, 1);
+        app.apply(Action::FocusLeft);
+        assert_eq!(outline(&app), all);
+        assert_eq!(app.focus, Focus::Checks);
+
+        // Space on a step collapses its job and selects it.
+        app.apply(Action::Down);
+        app.apply(Action::Down);
+        app.apply(Action::Toggle);
+        assert_eq!(outline(&app), ["CI", "lint", "test", "ext"]);
+        assert_eq!(app.repos[0].selected_check, 2);
+
+        // ← walks up to the run, collapses it, then leaves the pane.
+        app.apply(Action::FocusLeft);
+        assert_eq!(app.repos[0].selected_check, 0);
+        app.apply(Action::FocusLeft);
+        assert_eq!(outline(&app), ["CI", "ext"]);
+        app.apply(Action::FocusLeft);
+        assert_eq!(app.focus, Focus::List);
+
+        // Enter on a run toggles it; overrides survive polls.
+        app.apply(Action::FocusRight);
+        assert!(app.apply(Action::Enter).is_empty());
+        assert_eq!(outline(&app), ["CI", "lint", "test", "ext"]);
+        let fresh = tree_app().repos[0].prs[0].detail.clone().unwrap();
+        app.handle(loaded("o/a", vec![(1, Ok(fresh))]), t(5));
+        assert_eq!(outline(&app), ["CI", "lint", "test", "ext"]);
+    }
+
+    #[test]
+    fn steps_open_their_job_at_the_step() {
+        let mut app = tree_app();
+        let step_url = "https://github.com/o/r/actions/runs/7/job/2#step:2:1";
+        app.repos[0].selected_check = 4;
+        assert_eq!(
+            app.apply(Action::Enter),
+            vec![Effect::OpenUrl(step_url.into())]
+        );
+        assert_eq!(
+            app.apply(Action::CopyUrl),
+            vec![Effect::CopyToClipboard(
+                "https://github.com/o/r/pull/1".into()
+            )]
+        );
+        assert_eq!(
+            app.apply(Action::OpenUrl),
+            vec![Effect::OpenUrl(step_url.into())]
+        );
+        // A run opens its run page, cut from its first job's URL.
+        app.repos[0].selected_check = 0;
+        assert_eq!(
+            app.apply(Action::OpenUrl),
+            vec![Effect::OpenUrl("https://ci/lint".into())]
+        );
+        app.repos[0].prs[0].detail.as_mut().unwrap().checks[0].url =
+            Some("https://github.com/o/r/actions/runs/7/job/1".into());
+        assert_eq!(
+            app.apply(Action::OpenUrl),
+            vec![Effect::OpenUrl(
+                "https://github.com/o/r/actions/runs/7".into()
+            )]
+        );
+        // A completed job's step opens the job's log.
+        app.repos[0].selected_check = 1;
+        app.apply(Action::FocusRight);
+        app.apply(Action::Down);
+        assert!(app.apply(Action::Enter).is_empty());
+        assert!(matches!(&app.modal, Some(Modal::Log(v)) if v.check.name == "lint"));
+    }
+
+    #[test]
+    fn selecting_another_pr_refetches_with_its_steps() {
+        let mut app = tree_app();
+        app.focus = Focus::List;
+        assert!(app.tick(t(1)).is_empty());
+        app.apply(Action::Down);
+        assert_eq!(app.tick(t(1)), vec![fetch_with("o/a", &[1, 2], Some(2))]);
+        // Moving within the checks does not refetch.
+        app.handle(loaded("o/a", vec![]), t(1));
+        app.apply(Action::FocusRight);
+        app.apply(Action::Down);
+        assert!(app.tick(t(2)).is_empty());
+    }
+
     fn with_state(number: u64, state: PrState, checks: Vec<Check>) -> PrDetail {
         PrDetail {
             state,
@@ -1325,7 +1604,7 @@ pub(crate) mod tests {
         assert_eq!(app.status.as_deref(), Some("o/a: untracked closed #1, #3"));
         // The next poll only asks for the open PRs.
         app.apply(Action::Refresh);
-        assert_eq!(app.tick(t(2)), vec![fetch("o/a", &[2, 4])]);
+        assert_eq!(app.tick(t(2)), vec![fetch_with("o/a", &[2, 4], Some(4))]);
     }
 
     #[test]
@@ -1545,7 +1824,7 @@ pub(crate) mod tests {
         app.handle(loaded("o/a", vec![]), t(3));
         app.handle(loaded("o/b", vec![]), t(3));
         let effects = app.tick(t(4));
-        assert!(effects.contains(&fetch("o/b", &[4])), "{effects:?}");
+        assert!(effects.contains(&fetch_bg("o/b", &[4])), "{effects:?}");
         assert!(!effects.contains(&list_open("o/b")), "{effects:?}");
     }
 
@@ -1713,7 +1992,7 @@ pub(crate) mod tests {
         assert_eq!(app.repos[0].selected().unwrap().number, 9);
         assert!(app.is_tracked("o/a", 9));
         // The new PR is fetched right away.
-        assert_eq!(app.tick(t(2)), vec![fetch("o/a", &[1, 9])]);
+        assert_eq!(app.tick(t(2)), vec![fetch_with("o/a", &[1, 9], Some(9))]);
     }
 
     #[test]
