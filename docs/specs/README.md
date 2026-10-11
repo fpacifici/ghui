@@ -6,14 +6,15 @@ acceptance criteria; implementation details belong in
 
 | Spec                              | Status      |
 |-----------------------------------|-------------|
-| [0001-basic-ui.md](0001-basic-ui.md) | Implemented |
+| [0001-basic-ui.md](0001-basic-ui.md) | Superseded  |
+| [0002-pr-tracking.md](0002-pr-tracking.md) | Accepted |
 
 ## Template
 
 ```markdown
 # NNNN — Title
 
-Status: Draft | Accepted | Implemented
+Status: Draft | Accepted | Implemented | Superseded
 
 ## Goal
 ## Behaviour

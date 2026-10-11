@@ -1,6 +1,6 @@
 # 0001 — Basic UI shell
 
-Status: Implemented
+Status: Superseded by [0002](0002-pr-tracking.md)
 
 ## Goal
 
