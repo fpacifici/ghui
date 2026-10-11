@@ -127,6 +127,8 @@ impl RepoState {
 #[derive(Debug)]
 pub struct App {
     pub config: Config,
+    /// Shown in the empty-config hint.
+    pub config_path: String,
     pub repos: Vec<RepoState>,
     pub active: usize,
     pub focus: Focus,
@@ -140,7 +142,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: Config, now: DateTime<Utc>) -> Self {
+    pub fn new(config: Config, config_path: String, now: DateTime<Utc>) -> Self {
         let repos = config
             .repos
             .iter()
@@ -148,6 +150,7 @@ impl App {
             .collect();
         Self {
             config,
+            config_path,
             repos,
             active: 0,
             focus: Focus::default(),
@@ -419,7 +422,11 @@ pub(crate) mod tests {
 
     #[test]
     fn first_tick_fetches_every_pr_of_the_active_repo() {
-        let mut app = App::new(config(&[("o/a", &[1, 2]), ("o/b", &[3])]), t(0));
+        let mut app = App::new(
+            config(&[("o/a", &[1, 2]), ("o/b", &[3])]),
+            "cfg".into(),
+            t(0),
+        );
         assert_eq!(app.tick(t(0)), vec![fetch("o/a", &[1, 2])]);
         // Nothing more while the request is in flight.
         assert!(app.tick(t(10)).is_empty());
@@ -427,7 +434,7 @@ pub(crate) mod tests {
 
     #[test]
     fn polls_fast_while_checks_run_and_slow_after() {
-        let mut app = App::new(config(&[("o/a", &[1])]), t(0));
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
         app.tick(t(0));
         let running = detail(1, vec![check("build", CheckState::Pending)]);
         app.handle(loaded("o/a", vec![(1, Ok(running))]), t(1));
@@ -442,7 +449,7 @@ pub(crate) mod tests {
 
     #[test]
     fn refresh_forces_a_poll() {
-        let mut app = App::new(config(&[("o/a", &[1])]), t(0));
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
         app.tick(t(0));
         app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(1));
         assert!(app.tick(t(2)).is_empty());
@@ -452,7 +459,7 @@ pub(crate) mod tests {
 
     #[test]
     fn switching_tabs_polls_the_new_repo() {
-        let mut app = App::new(config(&[("o/a", &[1]), ("o/b", &[2])]), t(0));
+        let mut app = App::new(config(&[("o/a", &[1]), ("o/b", &[2])]), "cfg".into(), t(0));
         app.tick(t(0));
         app.apply(Action::NextRepo);
         assert_eq!(app.active, 1);
@@ -465,7 +472,7 @@ pub(crate) mod tests {
 
     #[test]
     fn inaccessible_repo_is_marked_and_retried_slowly() {
-        let mut app = App::new(config(&[("o/a", &[1])]), t(0));
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
         app.tick(t(0));
         let err = ApiError::NotFound("nope".into());
         app.handle(
@@ -484,7 +491,7 @@ pub(crate) mod tests {
 
     #[test]
     fn network_error_after_a_load_keeps_data_and_sets_status() {
-        let mut app = App::new(config(&[("o/a", &[1])]), t(0));
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
         app.tick(t(0));
         app.handle(loaded("o/a", vec![(1, Ok(detail(1, vec![])))]), t(1));
         app.apply(Action::Refresh);
@@ -503,7 +510,7 @@ pub(crate) mod tests {
 
     #[test]
     fn rate_limit_pauses_polling_until_reset() {
-        let mut app = App::new(config(&[("o/a", &[1])]), t(0));
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
         app.tick(t(0));
         app.handle(
             Msg::Prs {
@@ -522,7 +529,7 @@ pub(crate) mod tests {
 
     #[test]
     fn per_pr_errors_are_kept_on_the_entry() {
-        let mut app = App::new(config(&[("o/a", &[1, 2])]), t(0));
+        let mut app = App::new(config(&[("o/a", &[1, 2])]), "cfg".into(), t(0));
         app.tick(t(0));
         app.handle(
             loaded(
@@ -537,7 +544,7 @@ pub(crate) mod tests {
 
     #[test]
     fn selection_moves_in_the_focused_pane_and_clamps() {
-        let mut app = App::new(config(&[("o/a", &[1, 2])]), t(0));
+        let mut app = App::new(config(&[("o/a", &[1, 2])]), "cfg".into(), t(0));
         let checks = vec![check("a", CheckState::Fail), check("b", CheckState::Pass)];
         app.handle(
             loaded(
@@ -562,7 +569,7 @@ pub(crate) mod tests {
 
     #[test]
     fn selecting_a_running_pr_switches_to_the_fast_poll() {
-        let mut app = App::new(config(&[("o/a", &[1, 2])]), t(0));
+        let mut app = App::new(config(&[("o/a", &[1, 2])]), "cfg".into(), t(0));
         app.tick(t(0));
         let done = vec![check("a", CheckState::Pass), check("b", CheckState::Pass)];
         let running = vec![check("c", CheckState::Pending)];
@@ -582,7 +589,7 @@ pub(crate) mod tests {
 
     #[test]
     fn untrack_removes_the_pr_and_saves() {
-        let mut app = App::new(config(&[("o/a", &[1, 2])]), t(0));
+        let mut app = App::new(config(&[("o/a", &[1, 2])]), "cfg".into(), t(0));
         app.apply(Action::Down);
         let effects = app.apply(Action::Untrack);
         assert_eq!(effects, vec![Effect::SaveConfig(config(&[("o/a", &[1])]))]);
@@ -592,7 +599,7 @@ pub(crate) mod tests {
 
     #[test]
     fn copy_and_open_use_the_pr_or_focused_check_url() {
-        let mut app = App::new(config(&[("o/a", &[1])]), t(0));
+        let mut app = App::new(config(&[("o/a", &[1])]), "cfg".into(), t(0));
         assert!(app.apply(Action::CopyUrl).is_empty());
         app.handle(
             loaded(
@@ -616,7 +623,7 @@ pub(crate) mod tests {
 
     #[test]
     fn quit_stops_the_app() {
-        let mut app = App::new(Config::default(), t(0));
+        let mut app = App::new(Config::default(), "cfg".into(), t(0));
         assert!(app.tick(t(0)).is_empty());
         app.apply(Action::Quit);
         assert!(!app.running);
