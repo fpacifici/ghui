@@ -67,7 +67,8 @@ fn run<G: GitHub>(
             execute(&mut app, worker, effects, config_path);
         }
         while let Ok(msg) = results.try_recv() {
-            app.handle(msg, Utc::now());
+            let effects = app.handle(msg, Utc::now());
+            execute(&mut app, worker, effects, config_path);
         }
         let effects = app.tick(Utc::now());
         execute(&mut app, worker, effects, config_path);
@@ -90,9 +91,10 @@ fn execute<G: GitHub>(app: &mut App, worker: &Worker<G>, effects: Vec<Effect>, c
             Effect::OpenUrl(url) => {
                 open::that_detached(&url).map_err(|e| format!("cannot open {url}: {e}"))
             }
-            Effect::FetchPrs { .. } | Effect::FetchOpenPrs { .. } | Effect::FetchLog { .. } => {
-                unreachable!("network effects are spawned")
-            }
+            Effect::FetchPrs { .. }
+            | Effect::FetchOpenPrs { .. }
+            | Effect::FetchViewer
+            | Effect::FetchLog { .. } => unreachable!("network effects are spawned"),
         };
         if let Err(message) = result {
             app.report_error(message);

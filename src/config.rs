@@ -20,6 +20,9 @@ pub struct RepoConfig {
     pub name: String,
     #[serde(default)]
     pub prs: Vec<u64>,
+    /// PRs the user untracked; autodetect never re-adds them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dismissed: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -86,28 +89,40 @@ impl Config {
         fs::rename(&tmp, path).map_err(io_err)
     }
 
-    /// Adds `pr` to `repo`. Returns `false` if it was already tracked or the
-    /// repo is unknown.
+    /// Adds `pr` to `repo` and clears any dismissal of it. Returns `false`
+    /// if it was already tracked or the repo is unknown.
     pub fn track(&mut self, repo: &str, pr: u64) -> bool {
         match self.repos.iter_mut().find(|r| r.name == repo) {
             Some(r) if !r.prs.contains(&pr) => {
                 r.prs.push(pr);
+                r.dismissed.retain(|n| *n != pr);
                 true
             }
             _ => false,
         }
     }
 
-    /// Removes `pr` from `repo`. Returns `false` if it was not tracked.
+    /// Removes `pr` from `repo` and dismisses it, so autodetect does not
+    /// add it back. Returns `false` if it was not tracked.
     pub fn untrack(&mut self, repo: &str, pr: u64) -> bool {
         match self.repos.iter_mut().find(|r| r.name == repo) {
             Some(r) => {
                 let before = r.prs.len();
                 r.prs.retain(|n| *n != pr);
+                if !r.dismissed.contains(&pr) {
+                    r.dismissed.push(pr);
+                }
                 r.prs.len() != before
             }
             None => false,
         }
+    }
+
+    /// Whether the user untracked `pr` in `repo`.
+    pub fn is_dismissed(&self, repo: &str, pr: u64) -> bool {
+        self.repos
+            .iter()
+            .any(|r| r.name == repo && r.dismissed.contains(&pr))
     }
 }
 
@@ -152,6 +167,7 @@ mod tests {
         config.repos.push(RepoConfig {
             name: "a/b".into(),
             prs: vec![],
+            dismissed: vec![],
         });
         assert!(config.track("a/b", 7));
         assert!(!config.track("a/b", 7));
@@ -169,5 +185,23 @@ mod tests {
         assert!(config.untrack("a/b", 1));
         assert!(!config.untrack("a/b", 1));
         assert_eq!(config.repos[0].prs, vec![2]);
+    }
+
+    #[test]
+    fn untrack_dismisses_and_track_clears_the_dismissal() {
+        let mut config = Config::parse("repos:\n  - name: a/b\n    prs: [1]\n").unwrap();
+        assert!(!config.to_yaml().contains("dismissed"));
+        config.untrack("a/b", 1);
+        config.untrack("a/b", 1);
+        assert_eq!(config.repos[0].dismissed, vec![1]);
+        assert!(config.is_dismissed("a/b", 1));
+        assert!(!config.is_dismissed("x/y", 1));
+
+        let reloaded = Config::parse(&config.to_yaml()).unwrap();
+        assert_eq!(reloaded, config);
+
+        assert!(config.track("a/b", 1));
+        assert!(!config.is_dismissed("a/b", 1));
+        assert!(!config.to_yaml().contains("dismissed"));
     }
 }

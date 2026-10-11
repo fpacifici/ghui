@@ -12,7 +12,7 @@ terminal ─▶ event::map_key ─▶ App::apply ─────────┬�
  input                          App::tick (timer) ─┤          │
                                                    │          │ Msg (mpsc)
                                                    │          ▼
-                                                   │     App::handle
+                                                   │     App::handle ──▶ Effect
                                                    └──▶ main: save config,
                                                         OSC 52 copy, open URL
 terminal ◀── ui::render(&App)
@@ -24,7 +24,8 @@ The main loop in `main.rs` is synchronous and repeats:
 1. **Draw** — `ui::render(&app, frame)`.
 2. **Input** — `event::next_action` waits up to 100 ms for a key and maps it
    to an `Action`; `App::apply` returns `Effect`s.
-3. **Results** — every `Msg` waiting on the channel goes to `App::handle`.
+3. **Results** — every `Msg` waiting on the channel goes to `App::handle`,
+   which may return `Effect`s too (e.g. saving autodetected PRs).
 4. **Timers** — `App::tick(now)` returns the polls that are due.
 5. **Effects** — network effects are spawned on the tokio runtime by
    `worker::Worker`; the rest (config save, clipboard, browser) run inline.
@@ -40,7 +41,7 @@ without a terminal, network or real clock.
 |-------------------|--------------------------------------------------------------------------|---------------------|
 | `main.rs`         | Auth + config before the TUI, tokio runtime, main loop, local effects.   | Terminal, files, stdout |
 | `auth.rs`         | Token from `GH_TOKEN` → `GITHUB_TOKEN` → `gh auth token`.                | Runs `gh`           |
-| `config.rs`       | `~/.ghui/config.yaml`: load, create if missing, atomic save, track/untrack. | Files (load/save only) |
+| `config.rs`       | `~/.ghui/config.yaml`: load, create if missing, atomic save, track/untrack/dismiss. | Files (load/save only) |
 | `event.rs`        | `Action` enum, context-free `map_key`.                                    | Reads stdin events  |
 | `app.rs`          | `App` state (repos, focus, modal, status), `apply` / `handle` / `tick`.  | None                |
 | `log_view.rs`     | Log window state: content, scroll/follow, log poll bookkeeping.          | None                |
@@ -59,7 +60,8 @@ without a terminal, network or real clock.
   head commit's `statusCheckRollup`, which carries both check runs and
   legacy commit statuses. A repo with no tracked PRs still resolves the
   repository, which doubles as an access check.
-- **Open PRs** (picker): GraphQL, 50 most recently updated.
+- **Open PRs** (picker and autodetect): GraphQL, 50 most recently updated.
+- **Viewer login** (autodetect): `GET /user`, once per session.
 - **Logs**: `GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs`, which
   redirects to a short-lived download URL. A check run's GraphQL
   `databaseId` is the Actions job id. A 404 means "no log yet".
@@ -76,6 +78,17 @@ the current selection, so selecting a running PR speeds polling up
 immediately. An open log window for a running Actions job re-fetches the log
 every 5 s and does one final fetch after the job completes. A rate limit
 pauses all polling until its reset time.
+
+**Autodetect** ([spec 0003](specs/0003-pr-autodetect.md)) rides the same
+`App::tick`: the first tick with a repo configured looks up the user's
+login (`Effect::FetchViewer`, retried every 60 s on failure, then cached
+in `App`). Once known, the active, non-failed repo's open PRs are listed
+(`Effect::FetchOpenPrs`, the picker's effect) every 60 s. Every
+`Msg::OpenPrs` — from autodetect or the picker — goes through
+`App::autodetect`, which tracks the user's PRs that are neither tracked nor
+dismissed and returns `Effect::SaveConfig`. `Config::untrack` records the
+PR in the repo's `dismissed` list and `Config::track` clears it, so any
+untrack path (UI key or otherwise) suppresses re-detection for free.
 
 ## Design rules
 
