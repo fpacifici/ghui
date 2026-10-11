@@ -1,0 +1,291 @@
+//! Rendering. Reads [`App`] state and draws it; never mutates it.
+
+use chrono::{DateTime, Utc};
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Style, Stylize};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Paragraph, Wrap};
+
+use crate::app::{App, Focus};
+
+mod checks;
+mod detail;
+mod pr_list;
+mod tabs;
+
+pub fn render(app: &App, frame: &mut Frame) {
+    let status_height = u16::from(app.status.is_some());
+    let [tabs_area, body_area, status_area, footer_area] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(status_height),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+
+    tabs::render(app, frame, tabs_area);
+    render_body(app, frame, body_area);
+    if let Some(status) = &app.status {
+        frame.render_widget(Line::from(format!(" {status}")).red(), status_area);
+    }
+    frame.render_widget(footer(app), footer_area);
+}
+
+fn render_body(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(repo) = app.active_repo() else {
+        return render_empty_config(app, frame, area);
+    };
+    if let Some(error) = &repo.error {
+        let text = vec![
+            Line::from(format!("Cannot load {}", repo.name)).bold(),
+            Line::default(),
+            Line::from(error.to_string()),
+            Line::default(),
+            Line::from("Retrying every 60 s; press r to retry now.").dark_gray(),
+        ];
+        let paragraph = Paragraph::new(text)
+            .red()
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered());
+        return frame.render_widget(paragraph, area);
+    }
+
+    let [list_area, right_area] =
+        Layout::horizontal([Constraint::Percentage(30), Constraint::Fill(1)]).areas(area);
+    let [detail_area, checks_area] =
+        Layout::vertical([Constraint::Ratio(1, 3), Constraint::Ratio(2, 3)]).areas(right_area);
+
+    pr_list::render(repo, app.focus == Focus::List, frame, list_area);
+    let pr = repo.selected();
+    detail::render(pr, frame, detail_area);
+    checks::render(
+        pr.and_then(|p| p.detail.as_ref()),
+        repo.selected_check,
+        app.focus == Focus::Checks,
+        app.now,
+        frame,
+        checks_area,
+    );
+}
+
+fn render_empty_config(app: &App, frame: &mut Frame, area: Rect) {
+    let text = vec![
+        Line::from("No repositories tracked yet.").bold(),
+        Line::default(),
+        Line::from(format!("Add them to {}:", app.config_path)),
+        Line::default(),
+        Line::from("  repos:").cyan(),
+        Line::from("    - name: owner/repo").cyan(),
+        Line::from("      prs: [123]").cyan(),
+        Line::default(),
+        Line::from("then restart ghui. PRs can also be added with Ctrl+A.").dark_gray(),
+    ];
+    frame.render_widget(Paragraph::new(text).block(Block::bordered()), area);
+}
+
+fn footer(app: &App) -> Line<'static> {
+    let keys = match app.focus {
+        Focus::List => {
+            " q quit · </> repo · → checks · j/k move · ^A add · d untrack · r refresh · y copy url · o open"
+        }
+        Focus::Checks => {
+            " q quit · </> repo · ← PRs · j/k move · enter logs · r refresh · y copy url · o open check"
+        }
+    };
+    Line::from(keys).dark_gray()
+}
+
+/// Border style of a pane, highlighted when it has focus.
+pub(crate) fn pane(title: String, focused: bool) -> Block<'static> {
+    let block = Block::bordered().title(title);
+    if focused {
+        block.border_style(Style::new().fg(Color::Cyan))
+    } else {
+        block
+    }
+}
+
+/// Compact duration in the style of `gh pr checks`: `45s`, `3m12s`, `1h5m`.
+pub(crate) fn elapsed(start: Option<DateTime<Utc>>, end: DateTime<Utc>) -> String {
+    let Some(start) = start else {
+        return String::new();
+    };
+    let secs = (end - start).num_seconds().max(0);
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m{}s", s / 60, s % 60),
+        s => format!("{}h{}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::app::tests::{check, config, detail, loaded, t};
+    use crate::app::{Msg, RepoState};
+    use crate::config::Config;
+    use crate::event::Action;
+    use crate::github::{ApiError, CheckState, PrState};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    pub fn draw(app: &App, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| render(app, f)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    pub fn text(buffer: &Buffer) -> String {
+        buffer
+            .content()
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The first cell where `needle` starts.
+    pub fn find(buffer: &Buffer, needle: &str) -> Option<(u16, u16)> {
+        let text = text(buffer);
+        text.lines().enumerate().find_map(|(y, line)| {
+            let byte = line.find(needle)?;
+            let x = line[..byte].chars().count();
+            Some((x as u16, y as u16))
+        })
+    }
+
+    pub fn sample_app() -> App {
+        let mut app = App::new(
+            config(&[("o/a", &[1, 2]), ("o/b", &[3])]),
+            "cfg".into(),
+            t(0),
+        );
+        let mut one = detail(
+            1,
+            vec![
+                check("lint", CheckState::Fail),
+                check("build", CheckState::Pending),
+                check("test", CheckState::Pass),
+            ],
+        );
+        one.body = "## Summary\nDoes things.".into();
+        let mut two = detail(2, vec![]);
+        two.state = PrState::Merged;
+        app.handle(loaded("o/a", vec![(1, Ok(one)), (2, Ok(two))]), t(0));
+        app.now = t(20);
+        app
+    }
+
+    #[test]
+    fn main_view_shows_tabs_list_description_and_checks() {
+        let out = text(&draw(&sample_app(), 120, 30));
+        assert!(out.contains("o/a"));
+        assert!(out.contains("o/b"));
+        assert!(out.contains("#1 PR 1"));
+        assert!(out.contains("#2 PR 2 [merged]"));
+        assert!(out.contains("me · feature → main · open"));
+        assert!(out.contains("https://github.com/o/r/pull/1"));
+        assert!(out.contains("## Summary"));
+        assert!(out.contains("1 failing, 1 pending, 1 successful, 0 skipped"));
+        assert!(out.contains("X  lint"));
+        assert!(out.contains("*  build"));
+        assert!(out.contains("50s"), "running check elapsed: {out}");
+        assert!(out.contains("20s"), "completed check elapsed: {out}");
+        assert!(out.contains("q quit"));
+    }
+
+    #[test]
+    fn description_takes_the_top_third() {
+        let buffer = draw(&sample_app(), 120, 33);
+        // Body spans rows 3..32 (29 rows): description gets 10, checks 19.
+        let (_, checks_row) = find(&buffer, "Checks").unwrap();
+        assert_eq!(checks_row, 3 + 10);
+    }
+
+    #[test]
+    fn inaccessible_repo_is_dimmed_and_explains_why() {
+        let mut app = sample_app();
+        app.handle(
+            Msg::Prs {
+                repo: "o/b".into(),
+                result: Err(ApiError::NotFound("Could not resolve".into())),
+            },
+            t(0),
+        );
+        let buffer = draw(&app, 120, 30);
+        let (x, y) = find(&buffer, "o/b").unwrap();
+        assert_eq!(buffer[(x, y)].fg, Color::DarkGray);
+
+        app.apply(Action::NextRepo);
+        let out = text(&draw(&app, 120, 30));
+        assert!(out.contains("Cannot load o/b"));
+        assert!(out.contains("Could not resolve"));
+    }
+
+    #[test]
+    fn status_bar_shows_transient_errors() {
+        let mut app = sample_app();
+        app.report_error("cannot save config: disk full".into());
+        let out = text(&draw(&app, 120, 30));
+        assert!(out.contains("cannot save config: disk full"));
+    }
+
+    #[test]
+    fn empty_config_shows_a_hint() {
+        let app = App::new(Config::default(), "/home/me/.ghui/config.yaml".into(), t(0));
+        let out = text(&draw(&app, 80, 20));
+        assert!(out.contains("No repositories tracked yet."));
+        assert!(out.contains("/home/me/.ghui/config.yaml"));
+    }
+
+    #[test]
+    fn unloaded_and_failed_prs_are_shown_in_the_list() {
+        let mut app = App::new(config(&[("o/a", &[1, 2])]), "cfg".into(), t(0));
+        let out = text(&draw(&app, 100, 20));
+        assert!(out.contains("#1 loading…"));
+        app.handle(
+            loaded(
+                "o/a",
+                vec![(1, Err("gone".into())), (2, Ok(detail(2, vec![])))],
+            ),
+            t(0),
+        );
+        let out = text(&draw(&app, 100, 20));
+        assert!(out.contains("#1 gone"));
+        app.apply(Action::Down);
+        let out = text(&draw(&app, 100, 20));
+        assert!(out.contains("No checks reported"), "{out}");
+    }
+
+    #[test]
+    fn focused_check_is_highlighted() {
+        let mut app = sample_app();
+        app.apply(Action::FocusRight);
+        app.apply(Action::Down);
+        let buffer = draw(&app, 120, 30);
+        let (x, y) = find(&buffer, "build").unwrap();
+        assert!(
+            buffer[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(text(&buffer).contains("enter logs"));
+    }
+
+    #[test]
+    fn repo_state_helpers_are_consistent() {
+        let app = sample_app();
+        let repo: &RepoState = app.active_repo().unwrap();
+        assert_eq!(repo.selected_detail().unwrap().number, 1);
+    }
+
+    #[test]
+    fn elapsed_is_compact() {
+        assert_eq!(elapsed(None, t(0)), "");
+        assert_eq!(elapsed(Some(t(0)), t(45)), "45s");
+        assert_eq!(elapsed(Some(t(0)), t(192)), "3m12s");
+        assert_eq!(elapsed(Some(t(0)), t(3900)), "1h5m");
+    }
+}

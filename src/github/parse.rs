@@ -20,7 +20,11 @@ pub fn prs(response: &Value, numbers: &[u64]) -> Result<Vec<PrResult>, ApiError>
                 _ => Err(errors
                     .iter()
                     .find(|e| e.path.get(1).and_then(Value::as_str) == Some(alias.as_str()))
-                    .map(|e| e.message.clone())
+                    // The full message is too long for the narrow PR list.
+                    .map(|e| match e.kind.as_deref() {
+                        Some("NOT_FOUND") => "not found".to_string(),
+                        _ => e.message.clone(),
+                    })
                     .unwrap_or_else(|| format!("PR #{n} not returned"))),
             };
             (n, result)
@@ -343,7 +347,7 @@ mod tests {
         assert!(ci.completed_at.unwrap() > ci.started_at.unwrap());
 
         assert_eq!(prs[1].0, 99999);
-        assert!(prs[1].1.as_ref().unwrap_err().contains("99999"));
+        assert_eq!(prs[1].1.as_ref().unwrap_err(), "not found");
     }
 
     #[test]
