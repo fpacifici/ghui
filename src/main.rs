@@ -6,6 +6,8 @@ mod auth;
 #[allow(dead_code)] // wired up in M4
 mod config;
 mod event;
+#[allow(dead_code)]
+mod github;
 mod ui;
 
 use app::App;

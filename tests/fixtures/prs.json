@@ -1,0 +1,94 @@
+{
+  "data": {
+    "repository": {
+      "nameWithOwner": "fpacifici/assistant",
+      "pr_69": {
+        "number": 69,
+        "title": "Add a terminal-style TUI layout to the web UI",
+        "body": "## Summary\n\nAdds a TUI layout.\n\n- Panes\n- Menu bar",
+        "url": "https://github.com/fpacifici/assistant/pull/69",
+        "state": "MERGED",
+        "author": {
+          "login": "fpacifici"
+        },
+        "headRefName": "tui-layout",
+        "baseRefName": "main",
+        "commits": {
+          "nodes": [
+            {
+              "commit": {
+                "statusCheckRollup": {
+                  "contexts": {
+                    "nodes": [
+                      {
+                        "__typename": "CheckRun",
+                        "databaseId": 114153140536,
+                        "name": "ci",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                        "startedAt": "2026-10-10T06:35:38Z",
+                        "completedAt": "2026-10-10T06:37:38Z",
+                        "detailsUrl": "https://github.com/fpacifici/assistant/actions/runs/38031473890/job/114153140536",
+                        "title": null,
+                        "summary": null,
+                        "checkSuite": {
+                          "app": {
+                            "slug": "github-actions"
+                          },
+                          "workflowRun": {
+                            "workflow": {
+                              "name": "CI"
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "databaseId": 114153140600,
+                        "name": "frontend",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                        "startedAt": "2026-10-10T06:35:38Z",
+                        "completedAt": "2026-10-10T06:36:30Z",
+                        "detailsUrl": "https://github.com/fpacifici/assistant/actions/runs/38031473893/job/114153140600",
+                        "title": null,
+                        "summary": null,
+                        "checkSuite": {
+                          "app": {
+                            "slug": "github-actions"
+                          },
+                          "workflowRun": {
+                            "workflow": {
+                              "name": "Frontend CI"
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "pr_99999": null
+    }
+  },
+  "errors": [
+    {
+      "type": "NOT_FOUND",
+      "path": [
+        "repository",
+        "pr_99999"
+      ],
+      "locations": [
+        {
+          "line": 1,
+          "column": 138
+        }
+      ],
+      "message": "Could not resolve to a PullRequest with the number of 99999."
+    }
+  ]
+}

@@ -51,8 +51,8 @@ with a message telling the user to set `GH_TOKEN` or run `gh auth login`.
      URL, followed by the raw markdown description, truncated to fit.
    - Below: checks in the style of `gh pr checks`: a summary line
      (`2 failing, 1 pending, 10 successful`), then one row per check with a
-     status glyph (`✓` pass, `X` fail, `*` pending, `-` skipped/neutral/
-     cancelled), name, workflow or context, and elapsed time. Failing first,
+     status glyph (`✓` pass, `X` fail — including cancelled and timed out,
+     `*` pending, `-` skipped/neutral; same buckets as `gh pr checks`), name, workflow or context, and elapsed time. Failing first,
      then pending, then passing/other.
 4. **Status bar** — transient errors (failed poll, config write failure,
    rate limiting). Cleared by the next successful poll.

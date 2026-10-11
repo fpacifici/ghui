@@ -1,0 +1,37 @@
+{
+  "data": {
+    "repository": {
+      "pullRequests": {
+        "nodes": [
+          {
+            "number": 2825,
+            "title": "build(deps): require patched lru 0.18.2",
+            "isDraft": false,
+            "updatedAt": "2026-10-10T22:40:37Z",
+            "author": {
+              "login": "joshka"
+            }
+          },
+          {
+            "number": 2824,
+            "title": "fix(paragraph): account for horizontal borders in `line_count` (#2823)",
+            "isDraft": false,
+            "updatedAt": "2026-10-10T13:12:00Z",
+            "author": {
+              "login": "kuehni-dev"
+            }
+          },
+          {
+            "number": 2740,
+            "title": "feat: custom underlines",
+            "isDraft": false,
+            "updatedAt": "2026-10-10T03:23:04Z",
+            "author": {
+              "login": "shafai-pouya"
+            }
+          }
+        ]
+      }
+    }
+  }
+}
