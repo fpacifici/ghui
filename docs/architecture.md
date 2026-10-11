@@ -1,59 +1,99 @@
 # Architecture
 
 ghui is a single-binary Rust application that renders a terminal UI with
-[ratatui](https://ratatui.rs) on top of the crossterm backend.
+[ratatui](https://ratatui.rs) on top of the crossterm backend. It tracks a
+configured set of GitHub PRs and watches their checks.
 
 ## Overview
 
 ```
-          ┌──────────────┐   KeyEvent    ┌──────────────┐
-terminal ─▶  event.rs    ├──────────────▶│  Action      │
- input    │ (poll/read,  │   map_key()   │ (enum)       │
-          │  key mapping)│               └──────┬───────┘
-          └──────────────┘                      │ App::apply()
-                                                ▼
-          ┌──────────────┐   &App        ┌──────────────┐
-terminal ◀┤   ui.rs      │◀──────────────┤   app.rs     │
- output   │ (render only)│   render()    │ (state +     │
-          └──────────────┘               │  main loop)  │
-                                         └──────────────┘
+                 Action                         Effect
+terminal ─▶ event::map_key ─▶ App::apply ─────────┬──▶ worker (tokio) ──▶ GitHub API
+ input                          App::tick (timer) ─┤          │
+                                                   │          │ Msg (mpsc)
+                                                   │          ▼
+                                                   │     App::handle
+                                                   └──▶ main: save config,
+                                                        OSC 52 copy, open URL
+terminal ◀── ui::render(&App)
+ output
 ```
 
-The app follows a simple **Elm-style loop**:
+The main loop in `main.rs` is synchronous and repeats:
 
-1. **Draw** — `ui::render(&app, frame)` turns the current state into widgets.
-2. **Wait for input** — `event::next_action()` polls crossterm for up to
-   250 ms and maps a key press to an `Action` (or `None`).
-3. **Update** — `App::apply(action)` mutates state.
-4. Repeat until `app.running` is `false`.
+1. **Draw** — `ui::render(&app, frame)`.
+2. **Input** — `event::next_action` waits up to 100 ms for a key and maps it
+   to an `Action`; `App::apply` returns `Effect`s.
+3. **Results** — every `Msg` waiting on the channel goes to `App::handle`.
+4. **Timers** — `App::tick(now)` returns the polls that are due.
+5. **Effects** — network effects are spawned on the tokio runtime by
+   `worker::Worker`; the rest (config save, clipboard, browser) run inline.
+
+`App` never performs I/O. Everything it wants done is an `Effect`, and
+everything that happened is an `Action` or a `Msg`, so all behaviour —
+including the poll schedule, driven by an explicit `now` — is unit tested
+without a terminal, network or real clock.
 
 ## Modules
 
-| Module          | Responsibility                                                     | Side effects          |
-|-----------------|--------------------------------------------------------------------|-----------------------|
-| `src/main.rs`   | Installs `color_eyre`, sets up/restores the terminal via `ratatui::run`. | Terminal setup        |
-| `src/app.rs`    | `App` state, `Tab` enum, the main loop, `apply()` state transitions. | None in `apply()`     |
-| `src/event.rs`  | `Action` enum, reading terminal events, `map_key()` key bindings. | Reads stdin events    |
-| `src/ui.rs`     | Pure rendering of `App` into a `Frame`.                            | None                  |
+| Module            | Responsibility                                                           | Side effects        |
+|-------------------|--------------------------------------------------------------------------|---------------------|
+| `main.rs`         | Auth + config before the TUI, tokio runtime, main loop, local effects.   | Terminal, files, stdout |
+| `auth.rs`         | Token from `GH_TOKEN` → `GITHUB_TOKEN` → `gh auth token`.                | Runs `gh`           |
+| `config.rs`       | `~/.ghui/config.yaml`: load, create if missing, atomic save, track/untrack. | Files (load/save only) |
+| `event.rs`        | `Action` enum, context-free `map_key`.                                    | Reads stdin events  |
+| `app.rs`          | `App` state (repos, focus, modal, status), `apply` / `handle` / `tick`.  | None                |
+| `log_view.rs`     | Log window state: content, scroll/follow, log poll bookkeeping.          | None                |
+| `logs.rs`         | Cleans raw Actions logs (BOM, timestamps, ANSI, `\r`, endgroup).         | None                |
+| `worker.rs`       | Turns network `Effect`s into tokio tasks that send back a `Msg`.         | Spawns tasks        |
+| `github/mod.rs`   | `GitHub` trait and domain types (`PrDetail`, `Check`, `ApiError`, …).    | None                |
+| `github/query.rs` | GraphQL documents.                                                       | None                |
+| `github/parse.rs` | GraphQL JSON → domain types; tested against `tests/fixtures/`.           | None                |
+| `github/octo.rs`  | `GitHub` implemented with octocrab; HTTP error mapping.                  | Network             |
+| `ui/`             | Pure rendering: tabs, PR list, detail, checks, picker, log window.       | None                |
+
+## GitHub access
+
+- **PRs and checks**: one GraphQL request per repo, with one alias per
+  tracked PR (`pr_123: pullRequest(number: 123)`). Each PR includes its
+  head commit's `statusCheckRollup`, which carries both check runs and
+  legacy commit statuses. A repo with no tracked PRs still resolves the
+  repository, which doubles as an access check.
+- **Open PRs** (picker): GraphQL, 50 most recently updated.
+- **Logs**: `GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs`, which
+  redirects to a short-lived download URL. A check run's GraphQL
+  `databaseId` is the Actions job id. A 404 means "no log yet".
+- **Errors**: GraphQL `NOT_FOUND` / `FORBIDDEN` / `RATE_LIMITED` and HTTP
+  statuses map to `ApiError`. Repo-wide errors dim the tab; errors after a
+  successful load go to the status bar and keep the last good data.
+
+## Polling
+
+Only the active tab is polled. Its PRs are re-fetched every 5 s while the
+selected PR has pending checks, every 60 s otherwise (and every 60 s for a
+repo that failed to load). The interval is evaluated on each tick against
+the current selection, so selecting a running PR speeds polling up
+immediately. An open log window for a running Actions job re-fetches the log
+every 5 s and does one final fetch after the job completes. A rate limit
+pauses all polling until its reset time.
 
 ## Design rules
 
 - **Rendering is read-only.** `ui` takes `&App` and never mutates it.
-- **State transitions are pure.** `App::apply` takes an `Action`, so behaviour
-  can be unit tested without a terminal.
-- **Input mapping is pure.** `event::map_key` is separate from the I/O in
-  `next_action` so key bindings are testable.
-- **UI is snapshot-testable** with `ratatui::backend::TestBackend`
-  (see `ui::tests`).
-- **Terminal restore is automatic.** `ratatui::run` restores the terminal on
-  exit and on panic; `color_eyre` provides readable error reports.
+- **State transitions are pure.** `apply`, `handle` and `tick` return
+  effects instead of doing I/O.
+- **Input mapping is pure and context-free.** `event::map_key` doesn't know
+  about modals; `App::apply` decides what a key means where.
+- **Parsing is pure.** The octocrab layer only moves bytes; `github::parse`
+  is tested with recorded fixtures.
+- **UI is snapshot-testable** with `ratatui::backend::TestBackend`.
+- **Auth and config errors happen before the TUI starts**, so they print
+  normally. `ratatui::run` restores the terminal on exit and on panic.
 
-## Planned evolution
+## Testing
 
-- A `github` module wrapping the GitHub REST/GraphQL API (likely `octocrab`),
-  authenticated via `GH_TOKEN` / `GITHUB_TOKEN` or the `gh` CLI's stored token.
-- Async data loading (tokio) feeding results back to the loop as
-  `Action`s/messages, so the UI never blocks on the network.
-- Per-tab state structs once tabs diverge (filters, detail views, pagination).
+- `make test` runs everything offline.
+- `cargo test -- --ignored live_` runs a smoke test against the real API
+  (needs a token).
 
 See [specs/](specs/) for feature-level behaviour.
