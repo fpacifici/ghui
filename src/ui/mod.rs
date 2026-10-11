@@ -99,7 +99,7 @@ fn footer(app: &App) -> Line<'static> {
             " esc close · j/k scroll · pgup/pgdn page · g/G top/bottom · r refresh · y copy url · o open"
         }
         (None, Focus::List) => {
-            " q quit · </> repo · → checks · j/k move · ^A add · d untrack · r refresh · y copy url · o open"
+            " q quit · </> repo · → checks · j/k move · ^A add · ^D untrack · r refresh · y copy url · o open"
         }
         (None, Focus::Checks) => {
             " q quit · </> repo · ← PRs · j/k move · enter logs · r refresh · y copy url · o open check"
@@ -217,6 +217,25 @@ pub(crate) mod tests {
         assert!(out.contains("50s"), "running check elapsed: {out}");
         assert!(out.contains("20s"), "completed check elapsed: {out}");
         assert!(out.contains("q quit"));
+    }
+
+    #[test]
+    fn footer_advertises_ctrl_d_untrack_in_the_pr_list_only() {
+        let mut app = sample_app();
+        let out = text(&draw(&app, 140, 30));
+        assert!(out.contains("^D untrack"), "{out}");
+        app.apply(Action::FocusRight);
+        let out = text(&draw(&app, 140, 30));
+        assert!(!out.contains("untrack"), "{out}");
+    }
+
+    #[test]
+    fn untracked_pr_disappears_from_the_list() {
+        let mut app = sample_app();
+        app.apply(Action::Untrack);
+        let out = text(&draw(&app, 120, 30));
+        assert!(!out.contains("#1 PR 1"), "{out}");
+        assert!(out.contains("#2 PR 2 [merged]"), "{out}");
     }
 
     #[test]

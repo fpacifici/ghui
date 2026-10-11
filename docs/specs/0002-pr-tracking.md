@@ -27,7 +27,8 @@ repos:
 - The list order is the tab order.
 - If the file is missing it is created empty and the UI shows a hint.
 - Repos are added by editing the file. PRs are added (`Ctrl+A`) and removed
-  (`d`) from the UI, which rewrites the file (comments are not preserved).
+  (`Ctrl+D` or `d`) from the UI, which rewrites the file (comments are not
+  preserved).
 
 ## Authentication
 
@@ -80,6 +81,15 @@ Already tracked PRs are marked `✓`. `Enter` on an untracked PR adds it to the
 config, closes the picker and selects the new PR; `Enter` on a tracked PR
 does nothing.
 
+### Untracking a PR (`Ctrl+D` / `d`)
+
+Removes the selected PR of the current repo from the config and from the PR
+list, with no confirmation (it can be re-added with `Ctrl+A`). The selection
+stays at the same row, clamped to the shortened list, and moves to the first
+check. Results of a poll that was in flight for the PR are discarded. The key
+does nothing when no PR is selected or while a modal (picker, log window) is
+open.
+
 ### Log view (`Enter` on a check)
 
 - Full-screen overlay titled with the check name and state.
@@ -104,7 +114,7 @@ does nothing.
 | `PgUp` / `PgDn`, `g` / `G`       | Page / jump to top or bottom (log view)             |
 | `Enter`                          | Open log view (checks) / add PR (picker)            |
 | `Ctrl+A`                         | Open the add-PR picker                              |
-| `d`                              | Untrack the selected PR                             |
+| `Ctrl+D`, `d`                    | Untrack the selected PR                             |
 | `r`                              | Refresh now                                         |
 | `y`                              | Copy the PR URL to the clipboard (OSC 52)           |
 | `o`                              | Open the PR (or the focused check) in the browser   |
@@ -122,7 +132,8 @@ does nothing.
 - [x] Detail shows header with URL, raw description (top third) and checks.
 - [x] The selected PR's checks refresh every 5 s while pending, 60 s after.
 - [x] Picker lists 50 open PRs, marks tracked ones and adds on Enter.
-- [x] `d` untracks the selected PR.
+- [x] `Ctrl+D` (or `d`) untracks the selected PR and persists the change;
+      it is a no-op while a modal is open.
 - [x] Log view shows cleaned Actions logs, follows running jobs, and shows a
       summary for non-Actions checks.
 - [x] `y` copies and `o` opens the URL.
