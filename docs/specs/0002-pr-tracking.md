@@ -1,6 +1,6 @@
 # 0002 — PR tracking
 
-Status: Accepted
+Status: Implemented
 
 Supersedes [0001-basic-ui.md](0001-basic-ui.md). ghui is not a general
 GitHub client: it tracks a hand-picked set of pull requests across repos and
@@ -113,20 +113,20 @@ does nothing.
 
 ## Acceptance criteria
 
-- [ ] Config is loaded from `~/.ghui/config.yaml`, created if missing, and
+- [x] Config is loaded from `~/.ghui/config.yaml`, created if missing, and
       rewritten when PRs are added or removed.
-- [ ] Auth falls back GH_TOKEN → GITHUB_TOKEN → `gh auth token`, and exits
+- [x] Auth falls back GH_TOKEN → GITHUB_TOKEN → `gh auth token`, and exits
       with a clear error otherwise.
-- [ ] One tab per repo; inaccessible repos are dimmed and show their error.
-- [ ] PR list shows aggregate status, number, title and merged/closed tags.
-- [ ] Detail shows header with URL, raw description (top third) and checks.
-- [ ] The selected PR's checks refresh every 5 s while pending, 60 s after.
-- [ ] Picker lists 50 open PRs, marks tracked ones and adds on Enter.
-- [ ] `d` untracks the selected PR.
-- [ ] Log view shows cleaned Actions logs, follows running jobs, and shows a
+- [x] One tab per repo; inaccessible repos are dimmed and show their error.
+- [x] PR list shows aggregate status, number, title and merged/closed tags.
+- [x] Detail shows header with URL, raw description (top third) and checks.
+- [x] The selected PR's checks refresh every 5 s while pending, 60 s after.
+- [x] Picker lists 50 open PRs, marks tracked ones and adds on Enter.
+- [x] `d` untracks the selected PR.
+- [x] Log view shows cleaned Actions logs, follows running jobs, and shows a
       summary for non-Actions checks.
-- [ ] `y` copies and `o` opens the URL.
-- [ ] State transitions, scheduling, parsing and rendering are unit tested
+- [x] `y` copies and `o` opens the URL.
+- [x] State transitions, scheduling, parsing and rendering are unit tested
       without network access.
 
 ## Out of scope

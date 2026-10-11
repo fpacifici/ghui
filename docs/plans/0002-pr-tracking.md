@@ -106,6 +106,22 @@ New dependencies: `tokio`, `octocrab`, `serde`, `serde_json`,
   criteria.
 - `make check`; manual run against `fpacifici/assistant`.
 
+## Outcome
+
+All milestones landed, one commit each. Deviations from the plan:
+
+- Each poll re-fetches **all** tracked PRs of the active repo in its single
+  GraphQL request (same request count; keeps the list's status dots live).
+  The interval is still driven by the selected PR.
+- `y` / `o` were wired in M4 together with the other local effects, so M8
+  was docs and verification.
+- Log window state lives in its own `log_view.rs` module.
+- Cancelled / timed-out checks count as failing, matching `gh pr checks`.
+- Verified live against `fpacifici/assistant` (tabs, description, checks,
+  log of a completed job) and `ratatui/ratatui` (picker, untrack, failed
+  job log, OSC 52 copy via tmux). Not observed live: a job's log while it is
+  still running (no running job was available) and `o` opening a browser.
+
 ## Risks
 
 - **Live logs.** The public API has no streaming endpoint; running jobs show

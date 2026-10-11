@@ -1,8 +1,5 @@
 //! ghui — a terminal UI that tracks GitHub PRs and their checks.
 
-// Parts of the GitHub layer are used by the picker and log view (M6-M7).
-#![allow(dead_code)]
-
 mod app;
 mod auth;
 mod config;

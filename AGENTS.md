@@ -36,24 +36,40 @@ make check     # fmt-check + clippy + tests — run before every commit
 ├── Makefile                  # dev workflow entry points
 ├── rust-toolchain.toml       # pinned toolchain (stable + rustfmt, clippy)
 ├── src/
-│   ├── main.rs               # entry point: color_eyre + ratatui::run
-│   ├── app.rs                # App state, Tab enum, main loop, apply(Action)
+│   ├── main.rs               # auth + config, tokio runtime, main loop, local effects
+│   ├── auth.rs               # GH_TOKEN → GITHUB_TOKEN → `gh auth token`
+│   ├── config.rs             # ~/.ghui/config.yaml load/save
 │   ├── event.rs              # Action enum, terminal input → Action mapping
-│   └── ui.rs                 # pure rendering of App into a Frame
+│   ├── app.rs                # App state; pure apply/handle/tick → Effects
+│   ├── log_view.rs           # log window state (scroll, follow, polling)
+│   ├── logs.rs               # cleaning of raw Actions logs
+│   ├── worker.rs             # network Effects → tokio tasks → Msg channel
+│   ├── github/               # GitHub trait, types, GraphQL, parsing, octocrab
+│   └── ui/                   # pure rendering of App into a Frame
+├── tests/fixtures/           # recorded GitHub API responses for parser tests
 ├── docs/
 │   ├── architecture.md       # modules, data flow, design rules
+│   ├── plans/                # implementation plans for specs
 │   └── specs/                # one spec per feature (NNNN-name.md)
 └── .github/workflows/ci.yml  # CI: fmt, clippy, test, release build
 ```
 
 ## Conventions
 
-- Keep the loop shape **render → input → apply**. See
+- Keep the loop shape **render → input → apply → effects**. See
   [docs/architecture.md](docs/architecture.md).
-- `ui` never mutates state; `App::apply` and `event::map_key` stay pure so
-  they can be unit tested without a terminal.
+- `ui` never mutates state. `App::apply`, `App::handle`, `App::tick` and
+  `event::map_key` stay pure (no I/O; time is passed in) so they can be
+  unit tested without a terminal, network or clock. Anything with a side
+  effect is returned as an `Effect`.
 - New key binding → add an `Action` variant, map it in `event::map_key`,
-  handle it in `App::apply`, update the footer and the relevant spec.
+  handle it in `App::apply` (or `apply_modal`), update the footer and the
+  relevant spec.
+- New API call → add it to the `GitHub` trait, keep parsing in
+  `github::parse` with a fixture under `tests/fixtures/`, and return it to
+  the app as a `Msg` via `worker.rs`.
+- Tests never hit the network. `cargo test -- --ignored live_` runs the
+  live smoke test by hand.
 - New feature → add or update a spec in `docs/specs/` first.
 - Tests live next to the code in `#[cfg(test)] mod tests`. Use
   `ratatui::backend::TestBackend` for rendering tests.
